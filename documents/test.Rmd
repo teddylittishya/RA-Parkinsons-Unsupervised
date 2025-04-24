@@ -1,0 +1,13 @@
+---
+title: "test"
+author: "Shyazana Rahaman"
+date: "2024-10-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source('../R/cluster_module.R')
+source('../R/evaluation_module.R')
+```
+

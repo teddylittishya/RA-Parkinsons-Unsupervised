@@ -1,0 +1,319 @@
+---
+title: "Iris tests"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+```
+
+# Code
+
+```{r clustering_module, class.source='fold-show', summary=T}
+#' Clustering module
+#'
+#' Takes as input a distance matrix and runs clustering algorithms with a given set of parameters.
+#'
+#' @param x distance matrix object of type `dist` with dimensions n x n
+#' @param algo clustering algorithm
+#' @param k_method method for determining the number of clusters (ignored for OPTICS)
+#' @param ... additional arguments depending on the choice of `algo`
+#'  - For 'OPTICS': 
+#'     \itemize{
+#'       \item \code{minPts}: Minimum number of points in a neighborhood for a point to be considered a core point.
+#'       \item \code{xi}: Minimum reachability distance for clustering.
+#'     }
+#'   - For 'kmeans': 
+#'     \itemize{
+#'       \item \code{k}: Number of clusters or initial cluster centers.
+#'     }
+#'   - For 'hierarchical': 
+#'     \itemize{
+#'       \item \code{agg_method}: Linkage method ('complete', 'single', 'average', etc.) for hierarchical clustering.
+#'       \item \code{k}: Number of clusters to be formed by cutting the dendrogram.
+#'     }
+#' @return vector of length n with cluster memberships
+#' @import dbscan
+#' @import cluster
+#' @export
+#' 
+cluster_module <- function(x, 
+                           algo=c('OPTICS', 'kmeans', 'pam', 'fanny', 'hierarchical', 'agnes', 'diana'),
+                           ...) {
+  algo = match.arg(algo)
+  params <- list(...)
+  cvec <- vector()
+  switch(algo,
+         'OPTICS' = {
+           # Ordering Points to Identify the Clustering Structure (OPTICS)
+           reach <- dbscan::optics(x, minPts = params$minPts)
+           clusters <- dbscan::extractXi(reach, xi= params$xi, minimum=T)
+           cvec <- clusters$cluster
+         },
+         'kmeans' = {
+           # K-Means Clustering (Partitioning Clustering)
+           clusters <- stats::kmeans(x, centers = params$k)
+           cvec <- clusters$cluster
+         },
+         'pam' = {
+           # Partitioning Around Medoids (Partitioning Clustering)
+           clusters <- cluster::pam(x, k = params$k)
+           cvec <- clusters$clustering
+         },
+         'fanny' = {
+           # Fuzzy Analysis Clustering (Partitioning Clustering)
+           clusters <- cluster::fanny(x, k = params$k, maxit=1000)
+           cvec <- clusters$clustering
+         },
+         'hierarchical' = {
+           # Hierarchical Clustering
+           clusters <- stats::hclust(x, method = params$agg_method)
+           cvec <- stats::cutree(clusters, k = params$k)
+         },
+         'agnes' = {
+           # Agglomerative Nesting (Hierarchical Clustering)
+           clusters <- cluster::agnes(x, method = params$agg_method)
+           cvec <- stats::cutree(clusters, k = params$k)
+         },
+         'diana' = {
+           # Divisive Analysis Clustering (Hierarchical Clustering)
+           clusters <- cluster::diana(x)
+           cvec <- stats::cutree(clusters, k = params$k)
+         },
+         {
+           stop("The argument k_method is required. ", "Possible values are OPTICS, kmeans, hierarchical")
+         })
+  return(cvec)
+}
+
+```
+
+```{r evaluation_module, class.source='fold-show', summary=T}
+#' Evaluation module
+#'
+#' Takes as input the cluster memberships produced by a single run of `cluster_module`, and the
+#' parameters used by `cluster_module`. Returns a list of evaluation metrics for that run of
+#' `cluster_module`.
+#'
+#' @param cvec numeric vector of length n with cluster memberships
+#' @param parameter list of parameters used by `cluster_module`
+#' @param supervised boolean indicating whether or not to use supervised learning as a metric of
+#'   cluster quality
+#' @return numeric vector of evaluation metrics including
+#'   - Cohesiveness: Measures how tightly grouped points are within clusters.
+#'   - Separation: Measures how distinct clusters are from each other.
+#'   - Cluster Sizes: Number of data points in each cluster.
+#'   - Other relevant clustering metrics depending on the implementation.
+#' @import fpc
+#' @import clusterSim
+#' @export
+#' 
+evaluation_module <- function(x,
+                              cvec, 
+                              parameter, 
+                              supervised=F) {
+  if(is.null(cvec)) { 
+      return(list(nbclust=NA,
+                  cohesiveness=NA,
+                  distinctiveness=NA,
+                  n_between=NA,
+                  n_within=NA,
+                  avg_silwidth=NA,
+                  max_diameter=NA,
+                  min_separation=NA,
+                  pearson_gamma=NA,
+                  dunn_index=NA,
+                  dunn2_index=NA,
+                  entropy=NA,
+                  wb_ratio=NA,
+                  ch_index=NA,
+                  widest_gap=NA,
+                  sep_index=NA,
+                  index_C=NA,
+                  index_G2=NA,
+                  index_G3=NA,
+                  index_S=NA
+      )) 
+  }
+  # calculate clustering statistics
+  stats <- fpc::cluster.stats(x, cvec)
+  
+  # prepare output with evaluation metrics
+  out = list(nbclust = stats$cluster.number,
+             cohesiveness = stats$average.within, 
+             # Measures how closely points are grouped within the same cluster.
+             distinctiveness = stats$average.between, 
+             # Measures how well clusters are separated from each other.
+             n_between = stats$n.between,
+             # Indicates the number of between-cluster distance measurements.
+             n_within = stats$n.within,
+             # Indicates the number of within-cluster distance measurements.
+             avg_silwidth = stats$avg.silwidth,
+             #  Provides the average silhouette width, which measures the quality of the clusters.
+             max_diameter = stats$max.diameter,
+             # Measures the greatest distance within two points in a cluster
+             min_separation = stats$min.separation,
+             # Measures the minimum separation between clusters.
+             # gamma_coef = stats$g2,
+             # Represents the gamma coefficient, used to evaluate clustering quality.
+             # g3_coeff = stats$g3,
+             # Represents the g3 coefficient, used to evaluate clustering quality.
+             pearson_gamma = stats$pearsongamma,
+             # Represents the pearson gamma coefficient which assess clustering quality. 
+             dunn_index = stats$dunn,
+             # Evaluates the ratio of minimum inter-cluster distance to maximum intra-cluster distance.
+             dunn2_index = stats$dunn2,
+             # Measures the modified Dunn index.
+             entropy = stats$entropy,
+             # Measures the entropy (distance and homogenity) of the clusters
+             wb_ratio = stats$wb.ratio,
+             # Represents the within-between cluster ratio, used for clustering evaluation.
+             ch_index = stats$ch,
+             # Provides the Calinski-Harabasz index, used to evaluate the dispersion of clusters.
+             widest_gap = stats$widestgap,
+             # Measures the widest gap between clusters.
+             sep_index = stats$sindex,
+             # Represents the separation index, used for clustering evaluation.
+             index_C = clusterSim::index.C(x, cvec),
+             # Calculates Hubert & Levin C index - internal cluster quality index
+             index_G2 = clusterSim::index.G2(x, cvec),
+             # Calculates G2 internal cluster quality index
+             index_G3 = clusterSim::index.G3(x, cvec),
+             # Calculates G3 internal cluster quality index
+             index_S = clusterSim::index.S(x, cvec)
+             # Calculates Rousseeuw’s Silhouette internal cluster quality index
+  )
+  
+  #assign class to output list
+  class(out) = 'evaluation_module'
+  return(out)
+}
+```
+
+```{r run_all_function, class.source='fold-show', summary=T}
+run_all = function(data, k=seq(2, 10), xi=c(0.01, 0.05, 0.1, 0.2, 0.5), minPts=4:10) {
+    data.dist = dist(data, method="euclidean")
+
+    algos = eval(formals(args(cluster_module))$algo)
+    df1 = bind_rows(lapply(k, function(kval) {
+        bind_rows(lapply(algos, function(algo) {
+            if(algo == "OPTICS") { return(NULL) }
+            cvec = cluster_module(data.dist, algo=algo, k=kval, agg_method="complete")
+            c(param.algo=algo, param.k=kval, evaluation_module(data.dist, cvec))
+        }))
+    }))
+    optics_params = expand.grid(xi=xi, minPts=minPts)
+    df2 = bind_rows(apply(optics_params, 1, function(row) {
+        xival = row[["xi"]]
+        mpval = row[["minPts"]]
+        cvec = cluster_module(data.dist, algo="OPTICS", xi=xival, minPts=mpval)
+        c(list(param.algo="OPTICS", param.xi=xival, param.minPts=mpval), evaluation_module(data.dist, cvec))
+    }))
+    bind_rows(df1, df2) %>% relocate(starts_with('param'))
+}
+
+iris.test2 = function(method="euclidean", ...) {
+    iris.dist = dist(iris[, 1:4], method=method)
+    cvec = cluster_module(iris.dist, ...)
+    eval = evaluation_module(iris.dist, cvec, "hi")
+    list(cluster_sizes=table(cvec), evaluation_metrics=eval)
+}
+```
+
+# Running on Iris
+
+```{r}
+reactable(run_all(iris[ 1:4]))
+```
+
+# TODO
+
+- Figure out why there are so many warnings
+- Right now the `agg_method` is hard-coded to only `complete`
+  - it might be better to set the method from `hierarchical` to `hierarchical.D`,
+    `hierarchical.D2`, `hierarchical.single`, etc.
+- Why does `index_S` return many NaNs?
+  - Some of the other evaluation metrics also return NaNs
+- Figure out how to work the unclustered points (cvec == 0) from OPTICS with the evaluation metrics
+
+# Yi's notes
+
+- The main addition here is the `run_all` function, which runs through a bunch of default
+  parameter values. Please use this instead of the previous unit tests.
+- I've added code that handles if OPTICS gives no clusters.

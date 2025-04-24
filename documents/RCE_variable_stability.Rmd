@@ -1,0 +1,426 @@
+---
+title: "Test variable importance stability using RCE"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(yfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(parallel)
+source('../R/RCE_algorithm.R')
+```
+
+# Introduction
+
+[Link to RCE paper](https://link.springer.com/article/10.1007/s10994-013-5337-8)
+
+Our goal here is to repeat the bagging process (i.e., the whole RCE algorithm) many times in order
+to understand stability of the variable importance.
+
+# Parkinsons data set
+
+## Variable importance
+
+```{r rce_parkinson, cache=T}
+set.seed(42)
+RCE_result = mclapply(1:200, function(i) RCE(data_path="../example_data/Bases/parkinson.txt", 
+                                             nbiter=200,
+                                             vfun=ic))
+```
+```{r plotParkinsonData}
+# get mean varimp
+imp_vars = lapply(RCE_result, function(x) x$imp_var)
+vimp_mean = Reduce("+", imp_vars) / 200
+# get stdev
+vimp_stdev = apply(simplify2array(imp_vars), c(1, 2), sd)
+vimp_stdev_overall = apply(sapply(imp_vars, function(x) apply(x, 2, mean)), 1, sd)
+
+tmp = data.frame(varnum=paste('var', 1:ncol(vimp_mean)), 
+                 mean=t(vimp_mean), 
+                 sd=t(vimp_stdev),
+                 mean.overall=apply(t(vimp_mean), 1, mean),
+                 sd.overall=vimp_stdev_overall
+)
+tmp_overall = tmp[,c(1,6,7)] %>%
+    arrange(-mean.overall)
+tmp = rbind(
+      setNames(tmp[,c(1,2,4)], c("varnum", "mean", "sd")),
+      setNames(tmp[,c(1,3,5)], c("varnum", "mean", "sd")),
+      setNames(tmp[,c(1,6,7)], c("varnum", "mean", "sd"))
+)
+tmp$type = rep(c("Class 1", "Class 2", "overall"), each=nrow(tmp)/3)
+tmp$varnum = factor(tmp$varnum, levels=tmp_overall$varnum)
+
+p1 = ggplot(tmp %>% filter(varnum %in% tmp_overall$varnum[1:11])) +
+    geom_bar(aes(x=varnum, y=mean, fill=type), 
+             stat="identity", 
+             position=position_dodge()) +
+    geom_errorbar(aes(x=varnum, ymin=mean-sd, ymax=mean+sd, group=type), width=.2,
+             position=position_dodge(width=0.9)) +
+    xlab("") +
+    ylim(0, 3.5) +
+    ylab("Variable importance") +
+    scale_fill_brewer(name="", palette="Set1") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+p2 = ggplot(tmp %>% filter(varnum %in% tmp_overall$varnum[12:22])) +
+    geom_bar(aes(x=varnum, y=mean, fill=type), 
+             stat="identity", 
+             position=position_dodge()) +
+    geom_errorbar(aes(x=varnum, ymin=mean-sd, ymax=mean+sd, group=type), width=.2,
+             position=position_dodge(width=0.9)) +
+    xlab("") +
+    ylab("Variable importance") +
+    ylim(0, 3.5) +
+    scale_fill_brewer(name="", palette="Set1") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+p1 / p2 + plot_layout(guides='collect', axis_titles='collect')
+```
+
+Here, the bars represent the mean variable importance over 200 runs of RCE (`nbag`=200) and the
+error bars represent the standard deviation of the variable importance.
+
+
+<details><summary>Rerun with larger `nbag`</summary>
+```{r rce_parkinson_2, cache=T}
+set.seed(42)
+RCE_result2 = mclapply(1:200, function(i) RCE(data_path="../example_data/Bases/parkinson.txt", 
+                                             nbiter=400,
+                                             vfun=ic))
+```
+```{r plotParkinsonData500}
+# get mean varimp
+imp_vars2 = lapply(RCE_result2, function(x) x$imp_var)
+vimp_mean = Reduce("+", imp_vars2) / 200
+# get stdev
+vimp_stdev = apply(simplify2array(imp_vars2), c(1, 2), sd)
+vimp_stdev_overall = apply(sapply(imp_vars2, function(x) apply(x, 2, mean)), 1, sd)
+
+tmp = data.frame(varnum=paste('var', 1:ncol(vimp_mean)), 
+                 mean=t(vimp_mean), 
+                 sd=t(vimp_stdev),
+                 mean.overall=apply(t(vimp_mean), 1, mean),
+                 sd.overall=vimp_stdev_overall
+)
+tmp = rbind(
+      setNames(tmp[,c(1,2,4)], c("varnum", "mean", "sd")),
+      setNames(tmp[,c(1,3,5)], c("varnum", "mean", "sd")),
+      setNames(tmp[,c(1,6,7)], c("varnum", "mean", "sd"))
+)
+tmp$type = rep(c("Class 1", "Class 2", "overall"), each=nrow(tmp)/3)
+tmp$varnum = factor(tmp$varnum, levels=paste('var', 1:ncol(vimp_mean)))
+
+p1 = ggplot(tmp %>% filter(varnum %in% paste('var', 1:11))) +
+    geom_bar(aes(x=varnum, y=mean, fill=type), 
+             stat="identity", 
+             position=position_dodge()) +
+    geom_errorbar(aes(x=varnum, ymin=mean-sd, ymax=mean+sd, group=type), width=.2,
+             position=position_dodge(width=0.9)) +
+    xlab("Variable") +
+    ylab("Variable importance") +
+    scale_fill_brewer(name="", palette="Set1") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+p2 = ggplot(tmp %>% filter(varnum %in% paste('var', 12:22))) +
+    geom_bar(aes(x=varnum, y=mean, fill=type), 
+             stat="identity", 
+             position=position_dodge()) +
+    geom_errorbar(aes(x=varnum, ymin=mean-sd, ymax=mean+sd, group=type), width=.2,
+             position=position_dodge(width=0.9)) +
+    xlab("Variable") +
+    ylab("Variable importance") +
+    scale_fill_brewer(name="", palette="Set1") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+p1 / p2 + plot_layout(guides='collect', axis_titles='collect')
+```
+</details>
+
+*Observations*
+
+- The variable importance varies a lot, with large error bars for the most important variables.
+- It seems like the variability of var importance does not decrease much with increasing the
+  bagging iterations from 200 to 400
+
+## Scree test stability
+
+The authors of the paper use the scree plot as a hard limit to differentiate kept variables and not
+kept variables.
+
+Some details about their usage of the scree (elbow) method:
+
+- elbow point is calculated using the double derivative method
+- elbow points and cutoffs are calculated separately for different clusters
+  - this doesn't make a lot of sense to me in a two class problem such as Parkinsons
+- the different sets of important variables obtained for the different clusters are then combined
+  to form the superset which is returned
+
+```{r scree_plot_stability}
+tmp = data.frame(proportion=sort(table(unlist(map(imp_vars, ~ scree_test(.x)$sf_unique))) / 200, 
+                                 decreasing=T)) %>%
+    setNames(c("varnum", "proportion")) %>%
+    mutate(varnum = factor(paste('var', varnum), levels=paste('var', varnum)))
+
+p1 = ggplot(tmp[1:8,]) +
+    geom_bar(aes(x=varnum, y=proportion, fill='1'), 
+             stat="identity", 
+             position=position_dodge()) +
+    xlab("") +
+    ylim(0, 1) +
+    ylab("Proportion of runs where variable\nis chosen by scree test") +
+    scale_fill_brewer(name="", palette="Paired", guide="none") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+p2 = ggplot(tmp[9:nrow(tmp),]) +
+    geom_bar(aes(x=varnum, y=proportion, fill='1'), 
+             stat="identity", 
+             position=position_dodge()) +
+    xlab("") +
+    ylim(0, 1) +
+    ylab("Proportion of runs where variable\nis chosen by scree test") +
+    scale_fill_brewer(name="", palette="Paired", guide="none") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+p1 / p2 + plot_layout(guides='collect', axis_titles='collect')
+```
+
+*Observations*
+
+- Even the most important variable (var 17) is not chosen all of the time by the scree test
+
+# Breast tissue data set
+
+[link to UCI data set](https://archive.ics.uci.edu/dataset/192/breast+tissue)
+
+- $n = 106$ samples
+- $p = 10$ features
+- $k = 6$ classes (UCI website claims that 3 classes cannot be distinguished)
+
+Note: this is not the better-studied Wisconsin breast cancer data set (which I originally mistook
+it for) that has only two classes.
+
+## Variable importance
+
+```{r rce_breast, cache=T}
+set.seed(42)
+RCE_breast = mclapply(1:200, function(i) RCE(data_path="../example_data/Bases/Breast_Tissu.txt", 
+                                             nbiter=200,
+                                             vfun=ic))
+```
+```{r plotBreastData}
+# get mean varimp
+imp_vars2 = lapply(RCE_breast, function(x) x$imp_var)
+vimp_mean = Reduce("+", imp_vars2) / 200
+# get stdev
+vimp_stdev = apply(simplify2array(imp_vars2), c(1, 2), sd)
+vimp_stdev_overall = apply(sapply(imp_vars2, function(x) apply(x, 2, mean)), 1, sd)
+
+d = ncol(vimp_mean)
+nclass = nrow(vimp_mean)
+
+tmp = data.frame(varnum=paste('var', 1:ncol(vimp_mean)), 
+                 mean=c(c(t(vimp_mean)), apply(t(vimp_mean), 1, mean)), 
+                 sd=c(c(t(vimp_stdev)), vimp_stdev_overall)
+)
+tmp$type = rep(c(paste('Class', 1:nclass), 'overall'), each=d)
+tmp_overall = tmp %>%
+    filter(type == 'overall') %>%
+    arrange(-mean)
+tmp$varnum = factor(tmp$varnum, levels=tmp_overall$varnum)
+
+p1 = ggplot(tmp %>% filter(varnum %in% tmp_overall$varnum[1:floor(d/2)])) +
+    geom_bar(aes(x=varnum, y=mean, fill=type), 
+             stat="identity", 
+             position=position_dodge()) +
+    geom_errorbar(aes(x=varnum, ymin=mean-sd, ymax=mean+sd, group=type), width=.2,
+             position=position_dodge(width=0.9)) +
+    xlab("") +
+    ylim(0, max(tmp$mean + tmp$sd)) +
+    ylab("Variable importance") +
+    scale_fill_brewer(name="", palette="Set1") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+p2 = ggplot(tmp %>% filter(varnum %in% tmp_overall$varnum[(floor(d/2)+1):d])) +
+    geom_bar(aes(x=varnum, y=mean, fill=type), 
+             stat="identity", 
+             position=position_dodge()) +
+    geom_errorbar(aes(x=varnum, ymin=mean-sd, ymax=mean+sd, group=type), width=.2,
+             position=position_dodge(width=0.9)) +
+    xlab("") +
+    ylab("Variable importance") +
+    ylim(0, max(tmp$mean + tmp$sd)) +
+    scale_fill_brewer(name="", palette="Set1") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+p1 / p2 + plot_layout(guides='collect', axis_titles='collect')
+```
+
+## Scree test stability
+
+```{r scree_plot_func}
+#' @param tab table of times a scree test was chosen
+plot_scree = function(tab, ntotal=200, title=NULL) {
+    tab = sort(tab / ntotal, decreasing=T)
+    tmp = data.frame(proportion=tab) %>%
+    setNames(c("varnum", "proportion")) %>%
+    mutate(varnum = factor(paste('var', varnum), levels=paste('var', varnum)))
+
+    p1 = ggplot(tmp[1:floor(nrow(tmp)/2),]) +
+        geom_bar(aes(x=varnum, y=proportion, fill='1'), 
+                 stat="identity", 
+                 position=position_dodge()) +
+        xlab("") +
+        ylim(0, 1) +
+        ylab("Proportion of runs where variable\nis chosen by scree test") +
+        scale_fill_brewer(name="", palette="Paired", guide="none") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+    if(!is.null(title)) { p1 = p1 + ggtitle(title) }
+    p2 = ggplot(tmp[(floor(nrow(tmp)/2)+1):nrow(tmp),]) +
+        geom_bar(aes(x=varnum, y=proportion, fill='1'), 
+                 stat="identity", 
+                 position=position_dodge()) +
+        xlab("") +
+        ylim(0, 1) +
+        ylab("Proportion of runs where variable\nis chosen by scree test") +
+        scale_fill_brewer(name="", palette="Paired", guide="none") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle=60, hjust=1, vjust=1))
+    p1 / p2 + plot_layout(guides='collect', axis_titles='collect')
+}
+```
+```{r plotBreastScree}
+plot_scree(table(unlist(map(imp_vars2, ~ scree_test(.x)$sf_unique))))
+```
+
+*Observations*
+
+- Var 5 is never chosen, and var 6 is rarely chosen
+- Var 2 is almost always chosen
+- My interpretation of this is that the scree test is not very stable if we conduct only a single
+  run, as there is a small chance we would miss variables that are most important (var 2 for breast
+  tissue and var 17 for Parkinson), and other potentially important variables (var 1, 3, 14 for
+  Parkinson and var 7, 8, 4 for breast tissue) may have around 50% chance of being chosen.
+
+# Edit to scree test
+
+I wonder if taking the mean (or even max) importance across variables and then applying the scree
+test yields a more consistent result. I think mean could work, but it may obscure variables that
+are only important for distinguishing a single class. Although, this logic doesn't make sense given
+that we do not have *a priori* class labels.
+
+## Mean test
+
+Here, we take the mean of the variable importance across classes before performing the scree test.
+
+```{r scree_edit1, fig.height=6, fig.width=8}
+p1 = plot_scree(table(unlist(map(imp_vars, ~ scree_test(apply(.x, 2, mean))$sf_unique))),
+    title="Parkinson (scree test mean)") 
+p2 = plot_scree(table(unlist(map(imp_vars2, ~ scree_test(apply(.x, 2, mean))$sf_unique))),
+    title="Breast Tissue (scree test mean)")
+p1 | p2
+```
+
+## Max test
+
+Here, we take the max of the variable importance across classes before performing the scree test.
+
+```{r scree_edit2, fig.height=6, fig.width=8}
+p1 = plot_scree(table(unlist(map(imp_vars, ~ scree_test(apply(.x, 2, max))$sf_unique))),
+    title="Parkinson (scree test max)") 
+p2 = plot_scree(table(unlist(map(imp_vars2, ~ scree_test(apply(.x, 2, max))$sf_unique))),
+    title="Breast Tissue (scree test max)")
+p1 | p2
+```
+
+## Thoughts
+
+In both cases, the proportion of variables chosen across runs does not near 1. I don't think using
+mean or max prior to scree test is useful.
+
+
+# Some questions
+
+- Why can variable importance be greater than 1?
+  - I thought that variable importance was calculated via permutation of times a permuting a
+    variable changes the cluster assignment for a given sample OOB - divided by the times a
+    sample was OOB.
+- Is there a pattern to when variables are chosen by the scree test? i.e., is var 7 always
+  chosen when var 8 is not chosen, etc.

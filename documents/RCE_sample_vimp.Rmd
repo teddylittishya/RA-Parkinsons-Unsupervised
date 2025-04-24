@@ -1,0 +1,241 @@
+---
+title: "Using variable importance for individual samples"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(yfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(parallel)
+source('../R/RCE_algorithm.R')
+```
+
+# Introduction
+
+[Link to RCE paper](https://link.springer.com/article/10.1007/s10994-013-5337-8)
+
+This document examines the usage of the individual sample variable importance scores instead of the
+one produced by the RCE software. One of the main outputs is the proportion of
+out-of-bag samples that change cluster assignment after permutation as a metric of unsupervised
+feature importance. However, they do not report this information ($n x d$ matrix). Rather, they
+first use the pairwise distance matrix to calculate a final clustering and report aggregated
+variable importance per cluster ($n x k$ matrix) rather than for individual samples.
+
+I suspect that skipping this last clustering step and considering a mean variable importance over
+samples (i.e., the mean or sum) may be a more stable metric.
+
+# Parkinsons data set
+
+```{r run_rce2_func}
+run_RCE2 = function(data, nclusters, nbiter, vfun=message) {
+    data = as.data.frame(data)
+    k <- ncol(data) # Total number of features
+    n <- nrow(data) # Number of instances
+    p_bag <- round(sqrt(k)) # number of features for each bag
+
+    # For normalization
+    # Yi - I removed the caret dependency by manually range scaling the data
+    data <- as.data.frame(apply(data, 2, function(x) { 
+                        (x - min(x, na.rm=T)) / (max(x, na.rm=T) - min(x, na.rm=T)) 
+    }))
+
+    # Performs consensus clustering for feature selection
+    consensus_result <- consensus(data, nbiter, n, nclusters, k + 1, p_bag, vfun=vfun)
+    M <- consensus_result$M
+    imp <- consensus_result$imp
+
+    # Calculate the similarity matrix from the co-association matrix
+    SK <- M %*% t(M)
+    # Convert to dissimilarity matrix
+    Diss <- 1 - SK / nbiter
+    diag(Diss) <- 0
+    # Perform hierarchical clustering
+    Z <- hclust(as.dist(Diss), method = "average")
+    K_before <- cutree(Z, k = nclusters)
+
+    # Normalize feature importance scores
+    for (i in 1:n) {
+        for (j in 1:(k)) {
+            imp[i, j] <- imp[i, j] / nbiter
+        }
+    }
+
+    # Aggregate feature importance scores for each cluster
+    imp_var <- matrix(0, nclusters, k)
+    for (i in 1:n) {
+        for (j in 1:(k)) {
+            imp_var[K_before[i], j] <- imp_var[K_before[i], j] + imp[i, j]
+        }
+    }
+
+    # Return the selected features
+    selected_features_result <- scree_test(imp_var, nclusters, k)
+    selected_features <- selected_features_result$selected_features
+    sf_unique <- selected_features_result$sf_unique
+
+    vimp = data.frame(variable = colnames(data), importance = apply(imp, 2, mean))
+    vimp = vimp[order(vimp$importance, decreasing=T), ]
+    rownames(vimp) = NULL
+
+    return(list(imp_var = imp_var, 
+                selected_features = sf_unique, 
+                k_before = K_before,
+                imp_samp = imp,
+                imp = apply(imp, 2, mean)
+                ))
+}
+```
+
+```{r parkinsons_ind_varimp}
+data <- read.table("../example_data/Bases/parkinson.txt", header=F, sep = "\t")
+k = ncol(data)
+V <- data[, k] # True clustering
+true_nclusters <- max(V) # Number of clusters
+data <- data[, 1:(k - 1)]
+
+parkinson_ind_vimp = cache_rds({
+    mclapply(1:200, function(j) run_RCE2(data, nclusters=2, nbiter=200, vfun=ic)$imp, mc.cores=4)
+}, rerun=F, clean=T)
+```
+```{r parkinsons_ind_vimp_plot1, fig.height=3.5}
+tmp = do.call('rbind', parkinson_ind_vimp)
+tmp = data.frame(
+    mean=apply(tmp, 2, mean),
+    sd=apply(tmp, 2, sd),
+    varnum = paste("var", 1:ncol(tmp))
+)
+tmp$varnum = factor(tmp$varnum, levels=tmp$varnum[order(tmp$mean, decreasing=T)])
+ggplot(tmp) + 
+    geom_bar(aes(x=varnum, y=mean, fill="1"), stat="identity") +
+    geom_errorbar(aes(x=varnum, ymin=mean-sd, ymax=mean+sd), width=0.2) +
+    xlab('') +
+    ylab('Mean variable importance') + 
+    scale_fill_brewer(palette="Set2", guide="none") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust=1))
+```
+```{r spearmandistance_func}
+spearmandist = function(x, y) {
+    (1 - cor(x, y, method="spearman")) / 2
+}
+```
+```{r, eval=F}
+tmp = do.call('cbind', parkinson_ind_vimp)
+y = apply(tmp, 1, mean)
+cor(tmp, y)
+```
+
+# Breast Tissue
+
+```{r breast_ind_varimp}
+data <- read.table("../example_data/Bases/Breast_Tissu.txt", header=F, sep = "\t")
+k = ncol(data)
+V <- data[, k] # True clustering
+true_nclusters <- max(V) # Number of clusters
+data <- data[, 1:(k - 1)]
+
+bt_ind_vimp = cache_rds({
+    mclapply(1:200, function(j) run_RCE2(data, nclusters=2, nbiter=200, vfun=ic)$imp, mc.cores=4)
+}, rerun=F, clean=T)
+```
+```{r breast_ind_vimp_plot1, fig.height=3.5}
+tmp = do.call('rbind', bt_ind_vimp)
+tmp = data.frame(
+    mean=apply(tmp, 2, mean),
+    sd=apply(tmp, 2, sd),
+    varnum = paste("var", 1:ncol(tmp))
+)
+tmp$varnum = factor(tmp$varnum, levels=tmp$varnum[order(tmp$mean, decreasing=T)])
+ggplot(tmp) + 
+    geom_bar(aes(x=varnum, y=mean, fill="1"), stat="identity") +
+    geom_errorbar(aes(x=varnum, ymin=mean-sd, ymax=mean+sd), width=0.2) +
+    xlab('') +
+    ylab('Mean variable importance') + 
+    scale_fill_brewer(palette="Set2", guide="none") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust=1))
+```
+
+# Conclusions
+
+- The variable importance values seem far more stable than when aggregating over a cluster label
+- The ordering of the variable importance in the breast tissue data set is different than from the
+  original implementation. Previously, var 2 ranked highest, followed by var 1 and var 9. Now, the
+  variable 2 importance is much lower than the other two.
+

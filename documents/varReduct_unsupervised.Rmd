@@ -1,0 +1,930 @@
+---
+title: "Test feature selection and importance using unsupervised randomForest"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(yfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(parallel)
+library(varReduct)
+library(mlbench)
+library(dbscan)
+```
+
+# Introduction
+
+Here, I write code that tests the whether forward feature selection makes sense in the context of
+unsupervised randomForest.
+
+# VarReduct
+
+```{r runVarReductFunction, class.source='fold-show'}
+usVr = function(x, seed=42) {
+    set.seed(seed)
+    x_fake = x %>% mutate(across(everything(), ~ sample(.x, size=nrow(x))))
+    varReduct(predictor_vars=rbind(x, x_fake),
+                response_var=factor(c(rep('real', nrow(x)), rep('fake', nrow(x_fake)))),
+                varReduct_method='forwardSelect',
+                algo='randomForest',
+                select_method='elbow_and_gap',
+                trace=F,
+#                num_jobs=1,
+                seed=42)
+}
+```
+```{r usrf_func}
+usrf = function(x, seed=42, ntree=1000) {
+    set.seed(seed)
+    x_fake = x %>% mutate(across(everything(), ~ sample(.x, size=nrow(x))))
+    rf = randomForest::randomForest(x=rbind(x, x_fake),
+                      y=factor(c(rep('real', nrow(x)), rep('fake', nrow(x_fake)))),
+                      importance=T,
+                      keep.forest=F,
+                      ntree=ntree
+                      )
+    rf
+}
+```
+```{r plotVrFunc1}
+varimpcomp_plot = function(...) {
+    dots = list(...)
+    if(is.null(names(dots))) {
+        names(dots) = unlist(lapply(substitute(list(...))[-1], deparse))
+    }
+    ks = sapply(dots, function(x) nrow(importance(x)))
+    tmp = bind_rows(lapply(seq_along(dots), function(i) {
+        x = dots[[i]]
+        tmp = importance(x) %>% 
+            tibble::rownames_to_column('variable') %>% 
+            mutate(run=names(dots)[i]) %>%
+            mutate(vimp_rank=rank(-overall))
+        if(ks[i] > min(ks)) {
+            tmp$vimp_rank = tmp$vimp_rank - 1
+        }
+        tmp
+    }))
+    tmp2 = tmp %>% group_by(variable) %>%
+        summarize(vimp_rank=mean(vimp_rank)) %>%
+        arrange(-vimp_rank) %>%
+        pull(variable)
+    tmp$variable = factor(tmp$variable, levels=tmp2)
+    ggplot(tmp) +
+        aes(x=vimp_rank, y=variable) +
+        geom_segment(aes(xend=0, group=run), color="grey69", linetype="dashed",
+                     position=position_dodge(width=0.5)) +
+        geom_point(aes(color=run), position=position_dodge(width=0.5)) +
+        scale_color_brewer(name="", palette="Dark2") +
+        xlab("rank( variable importance )") +
+        ylab("") +
+        scale_x_continuous(breaks=scales::breaks_pretty()) +
+        guides(colour=guide_legend(reverse=T, position="bottom")) +
+        theme_minimal()
+}
+```
+```{r plotVrFunc2}
+vimp_spearman_plot = function(...) {
+    dots = list(...)
+    if(is.null(names(dots))) {
+        names(dots) = unlist(lapply(substitute(list(...))[-1], deparse))
+    }
+    vimps = lapply(names(dots), function(name) {
+        x = dots[[name]]
+        tmp = importance(x) %>% 
+            tibble::rownames_to_column('variable') %>%
+            select(!important)
+        colnames(tmp)[colnames(tmp) == 'overall'] = name
+        tmp
+    })
+    tmp = reduce(vimps, inner_join, by='variable') %>%
+        tibble::column_to_rownames('variable')
+    tmp = cor(tmp, method='spearman')
+    tmp = as.data.frame(tmp) %>%
+        tibble::rownames_to_column('var1') %>%
+        pivot_longer(-var1, names_to='var2', values_to='value') %>%
+        mutate(var1 = factor(var1, levels=colnames(tmp)),
+               var2 = factor(var2, levels=colnames(tmp)))
+    ggplot(tmp) +
+        aes(x=var1, y=var2, fill=value) +
+        geom_tile() +
+        geom_text(aes(label=round(value, 2))) +
+        scale_fill_gradient2(name="Spearman\ncorrelation", midpoint=0, low="blue", 
+                             mid="white", high="red", limits=c(-1, 1)) +
+        xlab("") +
+        ylab("") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle=60, vjust=1, hjust=1)) +
+        coord_fixed()
+}
+```
+```{r summary2df_func}
+summary2df = function(x) {
+    data.frame(unclass(summary(x)), check.names = FALSE, stringsAsFactors = FALSE) %>%
+        `rownames<-`( NULL )
+}
+```
+```{r combineDataSetFunc}
+combineDataSets = function(..., seed=42) {
+    set.seed(seed)
+    dfs = list(...)
+    if(is.null(names(dfs))) {
+        names(dfs) = unlist(lapply(substitute(list(...))[-1], deparse))
+    }
+    n = min(sapply(dfs, nrow))
+    bind_cols(lapply(names(dfs), function(name) {
+        df = dfs[[name]]
+        colnames(df) = paste(name, colnames(df), sep='__')
+        if(nrow(df) == n) { return(df) }
+#        k = df %>% pull(ends_with('Class')) %>% unique() %>% length()
+        df %>%# group_by(across(ends_with('Class'))) %>%
+            slice_sample(n=n) 
+    }))
+}
+```
+
+# Iris data set
+
+```{r iris_summary, summary=T}
+summary2df(iris)
+```
+
+```{r supervised_run_iris, summary=T}
+vr1 = cache_rds({
+    varReduct(predictor_vars=iris[,1:4],
+                response_var=factor(iris$Species),
+                varReduct_method='forwardSelect',
+                algo='randomForest',
+                trace=F,
+                num_jobs=4,
+                seed=42)
+}, rerun=F, clean=T)
+vr1$best_iter
+vr1$eval_vec
+vr1$num_vars_vec
+importance(vr1)
+```
+
+```{r unsupervised_run_with_true_labels, summary=T}
+vr2 = cache_rds({
+    usVr(iris)
+}, rerun=F, clean=T)
+vr2$best_iter
+vr2$eval_vec
+vr2$num_vars_vec
+importance(vr2)
+```
+
+```{r unsupervised_run_without_true_labels, summary=T}
+vr3 = cache_rds({
+    usVr(iris[,1:4])
+}, rerun=F, clean=T)
+vr3$best_iter
+vr3$eval_vec
+vr3$num_vars_vec
+importance(vr3)
+```
+
+```{r plot_iris, fig.width=10}
+p1 = varimpcomp_plot(supervised=vr1, unsupervised_wtl=vr2, unsupervised_wotl=vr3)
+p2 = vimp_spearman_plot(supervised=vr1, unsupervised_wtl=vr2, unsupervised_wotl=vr3)
+p1 + p2
+```
+```{r plot_vr_func}
+plot_vr = function(vr) {
+    tmp = as.data.frame(vr) %>%
+        mutate(across(c(AIC, `Corrected AIC`, `Out-of-bag error`), 
+                      ~ if(max(.x) == 0) 0 else .x/max(.x))) %>%
+        pivot_longer(c(AIC, `Corrected AIC`, `Out-of-bag error`))
+    ggplot(tmp) +
+        aes(x=`Number of Variables`, y=value, color=name) +
+        geom_line(alpha=0.5) +
+        geom_point(alpha=0.5) +
+        scale_color_brewer(name="", palette="Dark2") +
+        scale_x_continuous(breaks=scales::breaks_pretty(6)) +
+        ylab("Relative value") +
+        theme_minimal()
+}
+```
+```{r plot_iris2}
+plot_vr(vr2) / plot_vr(vr3) + plot_layout(guides='collect')
+```
+
+
+<mark>Observations</mark>
+
+- Including the true class labels, the true class labels are selected as the most important feature
+  when doing unsupervised feature selection
+- The ordering of the features is the exact same whether including true labels or not compared to
+  using supervised randomForest
+  - I tested this with a different seed before, and there was one swap (the `Petal` features),
+    indicating there is some stochasticity in it
+
+## Closer look at AIC in iris
+
+```{r iris_aic}
+imp = importance(vr3)
+rfs = cache_rds({
+    lapply(1:nrow(imp), function(i) {
+        vars = rownames(imp)[1:i]    
+        usrf(iris[,vars,drop=F], ntree=5000)
+    })
+}, rerun=F, clean=T)
+y_true = rfs[[3]]$y
+```
+
+```{r iris_aic_plot2}
+tmp = data.frame(
+    pred_real1 = rfs[[1]]$votes[,1],
+    pred_real2 = rfs[[2]]$votes[,1],
+    pred_real3 = rfs[[3]]$votes[,1],
+    pred_real4 = rfs[[4]]$votes[,1],
+    class = rep(c('real', 'fake'), each=nrow(iris)),
+    sample = 1:(2*nrow(iris))
+) %>% pivot_longer(!c(class, sample))
+ggplot(tmp) +
+    geom_point(aes(x=sample, y=value, color=name, shape=class), 
+               alpha=0.5) +
+    ylab('Proportion votes for fake class') +
+    theme_minimal()
+```
+
+```{r iris_aic_observed_only}
+aic_fixed = sapply(seq_along(rfs), function(i) {
+   clfAIC(y_true[1:nrow(iris)], y_pred=rfs[[i]]$votes[1:nrow(iris),], k=i)
+})
+tmp = as.data.frame(vr3) %>%
+    mutate(across(c(AIC, `Corrected AIC`, `Out-of-bag error`), 
+                  ~ if(max(.x) == 0) 0 else .x/max(.x))) %>%
+    pivot_longer(c(AIC, `Corrected AIC`, `Out-of-bag error`))
+tmp2 = data.frame(NA, seq_along(rfs), NA, NA, NA, NA, "AIC_observed_only", aic_fixed/max(aic_fixed))
+colnames(tmp2) = colnames(tmp)
+tmp = bind_rows(tmp, tmp2)
+ggplot(tmp) +
+    aes(x=`Number of Variables`, y=value, color=name) +
+    geom_line(alpha=0.5) +
+    geom_point(alpha=0.5) +
+    scale_color_brewer(name="", palette="Dark2") +
+    scale_x_continuous(breaks=scales::breaks_pretty(6)) +
+    ylim(0, 1) +
+    ylab("Relative value") +
+    theme_minimal()
+```
+
+
+
+
+# Breast Cancer
+
+```{r breast_cancer_summary, summary=T}
+data("BreastCancer", package = "mlbench")
+BreastCancer = BreastCancer %>% 
+    select(!Id) %>%
+    mutate(across(!Class, as.numeric)) %>%
+    filter(!is.na(Bare.nuclei))
+summary2df(BreastCancer)
+```
+
+```{r supervised_run_breast_cancer, summary=T}
+vr1 = cache_rds({
+    varReduct(predictor_vars=BreastCancer %>% select(-Class),
+                response_var=factor(BreastCancer$Class),
+                varReduct_method='forwardSelect',
+                algo='randomForest',
+                trace=F,
+                preprocess=F,
+                seed=42)
+}, rerun=F, clean=T)
+vr1$best_iter
+vr1$eval_vec
+vr1$num_vars_vec
+importance(vr1)
+```
+
+```{r unsupervised_run_with_true_labels_breast_cancer, summary=T}
+vr2 = cache_rds({
+    usVr(BreastCancer)
+}, rerun=F, clean=T)
+vr2$best_iter
+vr2$eval_vec
+vr2$num_vars_vec
+importance(vr2)
+```
+
+```{r unsupervised_run_without_true_labels_breast_cancer, summary=T}
+vr3 = cache_rds({
+    usVr(BreastCancer[,1:(ncol(BreastCancer)-1)])
+}, rerun=F, clean=T)
+vr3$best_iter
+vr3$eval_vec
+vr3$num_vars_vec
+importance(vr3)
+```
+
+```{r plot_bc, fig.width=10}
+p1 = varimpcomp_plot(supervised=vr1, unsupervised_wtl=vr2, unsupervised_wotl=vr3)
+p2 = vimp_spearman_plot(supervised=vr1, unsupervised_wtl=vr2, unsupervised_wotl=vr3)
+p1 + p2
+```
+```{r plot_bc2}
+plot_vr(vr2) / plot_vr(vr3) + plot_layout(guides='collect')
+```
+
+## Closer look at AIC in breast cancer
+
+```{r breast_cancer_aic}
+imp = importance(vr2)
+rfs = cache_rds({
+    lapply(1:nrow(imp), function(i) {
+        vars = rownames(imp)[1:i]    
+        usrf(BreastCancer[,vars,drop=F], ntree=5000)
+    })
+}, rerun=F, clean=T)
+y_true = rfs[[3]]$y
+```
+
+```{r breast_cancer_aic_plot1}
+tmp = data.frame(
+    pred_real3 = rfs[[3]]$votes[,1],
+    pred_real4 = rfs[[4]]$votes[,1],
+    class = rep(c('real', 'fake'), each=nrow(BreastCancer)),
+    sample = 1:(2*nrow(BreastCancer))
+) %>% pivot_longer(!c(class, sample))
+ggplot(tmp) +
+    geom_point(aes(x=sample, y=value, color=name, shape=class), 
+               alpha=0.5) +
+    ylab('Proportion votes for fake class') +
+    theme_minimal()
+```
+```{r breast_cancer_aic_plot2}
+tmp = data.frame(
+    pred_real1 = rfs[[1]]$votes[,1],
+    pred_real2 = rfs[[2]]$votes[,1],
+    pred_real3 = rfs[[3]]$votes[,1],
+    pred_real4 = rfs[[4]]$votes[,1],
+    class = rep(c('real', 'fake'), each=nrow(BreastCancer)),
+    sample = 1:(2*nrow(BreastCancer))
+) %>% pivot_longer(!c(class, sample))
+ggplot(tmp) +
+    geom_point(aes(x=sample, y=value, color=name, shape=class), 
+               alpha=0.5) +
+    ylab('Proportion votes for fake class') +
+    theme_minimal()
+```
+
+```{r breast_cancer_aic_observed_only}
+aic_fixed = sapply(seq_along(rfs), function(i) {
+   clfAIC(y_true[1:nrow(BreastCancer)], y_pred=rfs[[i]]$votes[1:nrow(BreastCancer),], k=i)
+})
+tmp = as.data.frame(vr2) %>%
+    mutate(across(c(AIC, `Corrected AIC`, `Out-of-bag error`), 
+                  ~ if(max(.x) == 0) 0 else .x/max(.x))) %>%
+    pivot_longer(c(AIC, `Corrected AIC`, `Out-of-bag error`))
+tmp2 = data.frame(NA, seq_along(rfs), NA, NA, NA, NA, "AIC_observed_only", aic_fixed/max(aic_fixed))
+colnames(tmp2) = colnames(tmp)
+tmp = bind_rows(tmp, tmp2)
+ggplot(tmp) +
+    aes(x=`Number of Variables`, y=value, color=name) +
+    geom_line(alpha=0.5) +
+    geom_point(alpha=0.5) +
+    scale_color_brewer(name="", palette="Dark2") +
+    scale_x_continuous(breaks=scales::breaks_pretty(6)) +
+    ylab("Relative value") +
+    ylim(0, 1) +
+    theme_minimal()
+```
+
+
+# All data sets
+
+Here I'm going to sweep over the classification data sets available inthe `mlbench` package and
+report the results in a table.
+
+I standardize all of the data sets such that the class label is assigned to the column `Class`.
+
+```{r build_all_data_sets}
+getdata <- function(...) {
+    e = new.env()
+    name = data(..., envir = e)[1]
+    e[[name]]
+}
+data_sets = list(
+    iris=iris,
+    BreastCancer=BreastCancer,
+    DNA=getdata("DNA"),
+    Glass=getdata("Glass"),
+    HouseVotes84=getdata("HouseVotes84"),
+    Ionosphere=getdata("Ionosphere"),
+#    LetterRecognition=getdata("LetterRecognition"),
+    PimaIndiansDiabetes=getdata("PimaIndiansDiabetes"),
+    Satellite=getdata("Satellite"),
+#    Servo=getdata("Servo"),
+#    Shuttle=getdata("Shuttle"),
+    Sonar=getdata("Sonar"),
+#    Soybean=getdata("Soybean"),
+    Vehicle=getdata("Vehicle"),
+#    Vowel=getdata("Vowel"),
+    Zoo=getdata("Zoo")
+)
+data_sets = lapply(data_sets, function(x) {
+    rn = c('lettr', 'Type', 'diabetes', 'type', 'classes', 'Species')
+    if(any(colnames(x) %in% rn)) {
+        colnames(x)[colnames(x) %in% rn] = 'Class'
+    }
+    x[complete.cases(x),]
+})
+```
+```{r characterize_all_data_sets, eval=T}
+supervised_rfs = cache_rds({
+    tmp = lapply(data_sets, function(x) {
+        ic(dim(x))
+        y = x$Class
+        rf = randomForest::randomForest(x = x %>% select(-Class), 
+                          y = factor(y), 
+                          sampsize=rep(min(table(y)), length(table(y))),
+                          strata=factor(y), importance=T, keep.forest=F, ntree=10000)
+    
+        rf
+    })
+    names(tmp) = names(data_sets)
+    tmp
+}, rerun=F, clean=T)
+
+ds_info = bind_rows(lapply(names(data_sets), function(n) {
+    x = data_sets[[n]]
+    y = x$Class
+    rf = supervised_rfs[[n]]
+    data.frame(name=n, 
+               num_obs=nrow(x),
+               num_pred_vars=ncol(x) - 1,
+               num_classes=length(table(y)),
+               base_accuracy=round(max(table(y)/nrow(x)), digits=3),
+               rf_accuracy=round(1 - rf$err.rate[10000, 1], digits=3)
+    )
+}))
+rownames(ds_info) = NULL
+#supervised_rfs[[1]]$err.rate[10000,]
+reactable(ds_info)
+```
+```{r setFinished}
+finished = F
+```
+```{r unsupervised_wotl_all_data_sets, eval=finished}
+unsupervised_rfs1 = cache_rds({
+    tmp = lapply(names(data_sets), function(n) {
+                     ic(n)
+                     usVr(data_sets[[n]] %>% select(-Class))
+    })
+    names(tmp) = names(data_sets)
+    tmp
+}, rerun=F, clean=T)
+```
+```{r comp_us_sup_all_data_sets, eval=finished}
+
+```
+
+I have 11 data sets here, most of which yield a random forest classification accuracy > 0.9. Only 4 
+data sets have an rf accuracy < 0.9, with the lowest being the Glass data set with an out-of-bag
+accuracy of 0.66.
+
+# Adding noise features
+
+One thing I am curious about is what happens with a diluted clustering signal. One way of testing
+this is by adding features with little correlation to the class labels or an existing feature.
+
+```{r noise_feat_func}
+add_noise_numeric = function(df, n=10, feat=df[,1], r=0.05, prefix="noise.", seed=42) {
+    set.seed(seed)
+    tmp = do.call('data.frame', lapply(1:n, faux::rnorm_pre, x=feat, r=r))
+    colnames(tmp) = paste0(prefix, 1:n)
+    cbind(df, tmp)
+}
+add_noise_categorical = function(df, n=10, feat=df[,1], r=0.05, prefix="noise.", seed=42) {
+    set.seed(seed)
+    #TODO
+}
+```
+
+# Combined Data Sets
+
+Another way a signal might be diluted is if the data supports multiple sets of clusters. We
+can simulate this situation by combining two data sets column-wise, randomizing the class labels in
+one of them such that each sample belongs to two classes, one for each data set (e.g., sample 1 is
+simultaneously a versicolor and a breast cancer sample).
+
+## Combined Iris and Breast Cancer
+
+An example of what a combined data set might look like:
+
+```{r combine_df_iris_breast_cancer, summary=T}
+test1 = combineDataSets(iris, BreastCancer)
+summary2df(test1)
+```
+```{r combine_df_iris_breast_cancer_class_label_confusion_matrix}
+confusionMatrix(factor(test1$iris__Species), factor(test1$BreastCancer__Class))
+```
+
+Ignore the "Observed" and "Predicted" labels as these are reused from my confusion matrix code.
+
+The table above shows that we now have 39 benign-setosa samples, 31 benign-versicolor samples, 11
+malignant-setosa samples, etc. 
+
+I do not enforce that the class labels across the two data sets are perfectly randomized, so there
+is some slight imbalances in the combined classes, but in general, they are quite randomized.
+
+```{r us_vr_iris_breast_cancer}
+irisbc_rf = cache_rds({
+    x = test1 
+    set.seed(42)
+    x_fake = x %>% mutate(across(everything(), ~ sample(.x, size=nrow(x))))
+    rf = randomForest::randomForest(x=rbind(x, x_fake), 
+                      y =factor(c(rep('real', nrow(x)), rep('fake', nrow(x_fake)))), 
+                      importance=T, 
+                      keep.forest=T, 
+                      ntree=10000)
+    rf
+}, rerun=F, clean=T)
+```
+```{r iris-bc_unsupervised_importance_table, summary=T}
+as.data.frame(importance(irisbc_rf)[,3, drop=F]) %>%
+    rename(overall=MeanDecreaseAccuracy) %>%
+    tibble::rownames_to_column('variable') %>%
+    arrange(-overall)
+```
+
+We can create an algorithm that traverses the forest and identifies co-occurence of features
+together. I suspect that this may distinguish the features that support one set of cluster
+assignments, and the features that support a second set of cluster assignments.
+
+```{r traverseForestFunc1}
+#' Count the times in a forest that two variables are chosen for adjacent nodes
+traverse1 = function(rf, ncores=1) {
+    forest = rf$forest
+    d = nrow(importance(rf)) # number of variables
+    adj = Reduce('+', mclapply(1:rf$ntree, function(k) {
+        ar = matrix(0, nrow=d, ncol=d)
+        bestvar = forest$bestvar[,k]
+        ld = forest$treemap[,1,k]
+        rd = forest$treemap[,2,k]
+        for(i in 1L:length(bestvar)) {
+            if(bestvar[i] == 0) next
+            if(bestvar[ld[i]] > 0) 
+                ar[bestvar[i], bestvar[ld[i]]] = ar[bestvar[i], bestvar[ld[i]]] + 1
+            if(bestvar[rd[i]] > 0) 
+                ar[bestvar[i], bestvar[rd[i]]] = ar[bestvar[i], bestvar[rd[i]]] + 1
+        }
+        ar
+    }, mc.cores=ncores))
+    colnames(adj) = rownames(adj) = rownames(importance(rf))
+    adj = adj + t(adj)
+
+    fact = table(rf$forest$bestvar)
+    fact = as.numeric(fact[as.character(1:nrow(adj))])
+    fact[is.na(fact)] = 1
+    t(adj / fact) / fact
+}
+#head(randomForest::getTree(irisbc_rf, 1))
+```
+```{r traverseForestFunc2}
+#' Count the times in a forest that two variables are chosen within depth $d$
+traverse2 = function(rf, depth=3, ncores=1) {
+    forest = rf$forest
+    d = nrow(importance(rf)) # number of variables
+    adj = Reduce('+', mclapply(1:rf$ntree, function(k) {
+        ar = matrix(0, nrow=d, ncol=d)
+        bestvar = forest$bestvar[,k]
+        ld = forest$treemap[,1,k]
+        rd = forest$treemap[,2,k]
+        for(i in 1L:length(bestvar)) {
+            if(bestvar[i] == 0) next
+            if(bestvar[ld[i]] > 0) 
+                ar[bestvar[i], bestvar[ld[i]]] = ar[bestvar[i], bestvar[ld[i]]] + 1
+            if(bestvar[rd[i]] > 0) 
+                ar[bestvar[i], bestvar[rd[i]]] = ar[bestvar[i], bestvar[rd[i]]] + 1
+        }
+        ar
+    }, mc.cores=ncores))
+    colnames(adj) = rownames(adj) = rownames(importance(rf))
+    adj = adj + t(adj)
+
+    fact = table(rf$forest$bestvar)
+    fact = as.numeric(fact[as.character(1:nrow(adj))])
+    fact[is.na(fact)] = 1
+    t(adj / fact) / fact
+}
+```
+```{r traverse1_irisbc, fig.height=4}
+adj = traverse1(irisbc_rf, ncores=1)
+
+tmp = as.data.frame(adj) %>%
+    tibble::rownames_to_column('var1') %>%
+    pivot_longer(-var1, names_to='var2', values_to='value') %>%
+    mutate(var1 = factor(var1, levels=colnames(adj)),
+           var2 = factor(var2, levels=colnames(adj)))
+p1 = ggplot(tmp) +
+    aes(x=var1, y=var2, fill=value) +
+    geom_tile() +
+#    geom_text(aes(label=round(value, 2))) +
+    scale_fill_gradient(name="Feature Pairwise\nCo-occurence", low="white", high="red") +
+    xlab("") +
+    ylab("") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, vjust=1, hjust=1)) +
+    coord_fixed()
+tmp2 = adj
+tmp2[lower.tri(tmp2, diag=T)] = NA
+tmp = as.data.frame(tmp2) %>%
+    tibble::rownames_to_column('var1') %>%
+    pivot_longer(-var1, names_to='var2', values_to='value') %>%
+    mutate(var1 = factor(var1, levels=colnames(adj)),
+           var2 = factor(var2, levels=colnames(adj))) %>%
+    filter(!is.na(value))
+p2 = ggplot(tmp) +
+    geom_histogram(aes(x=value), bins=20) + 
+    xlab('Pairwise Co-occurence') +
+    ylab('Count') +
+    theme_minimal()
+p1
+p2
+```
+
+Ignore the diagonals on the heatmap, as these capture edge cases where sometimes the forest splits
+on the same variable consecutively.
+
+The exact formula for pairwise co-occurence used here is:
+
+$$
+\begin{equation}
+\textrm{Co-occurence}_{i, j} = \frac{\sum_{t \in T} \sum_{n \in N_{t}} I(i \in E(n))I(j \in E(n))}
+    {f_{i}f_{j}} ,
+\end{equation}
+$$
+
+where
+$i$ and $j$ are features,
+$f_{i}$ is the count of feature label $i$ over all nodes in a forest,
+$T$ is the set of trees in a forest,
+$N$ is the set of nodes in a tree,
+$I$ is the indicator function,
+and
+$E$ is the set of edges for node $n$.
+
+```{r co-occurence_value_table, summary=T}
+tmp %>% arrange(-value) %>%
+    mutate(value=formatC(value, format="e", digits=3))
+```
+
+<mark>Observations</mark>
+
+- Basic unsupervised random forest algorithm
+  - The algorithm by itself seems to still be able to distinguish important and unimportant
+    features, with the Mitoses and Sepal.Width features ranking least in importance (as they are in
+    the original data sets).
+  - Several of the breast cancer features seem to dominate the feature importance over the iris
+    features.
+    - This may be due to breast cancer having more features than iris
+- With feature co-occurence calculation
+  - Co-occurence appears to correspond with the original separate data sets
+  - If we do not normalize by the total times features occur in the forest (i.e., remove the
+    denominator in equation (1)), then the class labels have the least co-occurence counts
+    - maybe this indicates a bias against choosing categorical variables by unsupervised random
+      forest
+  - The histogram shows a bi- or tri-modal distribution, which again supports that the features of
+    different data sets are clustering together
+    - Based on the table with ordering, we can see that the comparisons in the smallest mode
+      (greater than 5e-06) are between the BreastCancer\_\_Class and other BreastCancer features
+      (cell.size, normal.nucleoli, bare.nuclei, cell.shape, and marg.adhesion), and one comparison
+      between iris species and iris petal width.
+    - Every cross data set comparison (between an iris feature and a breast cancer feature) ranks
+      lower than within data set comparisons, with a cutoff at 4.011e-06
+  - The rankings of the co-occurence between features of the same data set appear to be consistent
+    with the general feature importance, i.e., co-occurence values of the iris petal features are
+    higher than co-occurence values of the iris sepal features
+- It may be useful to repeat this analysis without including the true class labels
+
+### Co-occurence clustering of features
+
+We can define a distance measure based on the co-occurence between features with:
+
+$$
+\begin{equation}
+Distance_{i, j} = 1 - \frac{\textrm{Co-occurence}_{i, j} }{\max (\textrm{Co-occurence})} . 
+\end{equation}
+$$
+
+Using hierarchical clustering, we can show that the largest distance is between the two data sets.
+
+```{r ibc_hierarchical}
+ibc.dist = as.dist(1 - adj/max(adj))
+#ibc.dist2 = as.dist(-1 * log(adj))
+# this second one does not work very well at all, the distances at the leaves are way longer than
+# any similarity
+plot(hclust(ibc.dist, method = "ward.D2"), hang=-1)
+```
+```{r ibc_hclust_cluster_assignments, summary=T}
+cutree(hclust(ibc.dist), k=2)
+```
+
+Likewise, optics can identify clusters (along with features that might be removed).
+
+```{r ibc_optics_other_details, summary=T}
+#round(sqrt(nrow(adj)))
+opt = optics(ibc.dist, minPts=3) # I think minPts is set somewhat arbitrarily - i.e., however many
+# features you think should support a given clustering minus 2; in this case, because iris only has
+# 5 features (including true class labels, it's detected best when using minPts <= 3
+ibc.umap = umap::umap(as.matrix(ibc.dist), input="dist")
+tmp = as.data.frame(ibc.umap$layout) %>%
+    tibble::rownames_to_column("feature")
+opt = extractXi(opt, xi=0.05, minimum=T)
+plot(opt)
+```
+```{r ibc_plot_optics_umap, fig.height=7, fig.width=9}
+tmp$cluster = factor(ifelse(opt$cluster == 0, "unclustered", as.character(opt$cluster)))
+ggplot(tmp) +
+    aes(x=V1, y=V2) +
+    geom_point(aes(color=cluster), size=3) +
+    ggrepel::geom_text_repel(aes(label=feature)) +
+    ggtitle("OPTICS clustering with UMAP mapping") +
+    xlab('umap 1') +
+    ylab('umap 2') +
+    theme_minimal()
+```
+
+### Within cluster feature importance
+
+I think there are several ways within cluster feature importance might be described. Two of which
+I've described here:
+
+1. Use the unsupervised feature importance lists for individual clusters of features
+2. Use the average rank co-occurence between features in the same cluster
+
+### AIC
+
+```{r irisbc_varReduct_AIC}
+imp = data.frame(importance(irisbc_rf)) %>%
+    arrange(desc(MeanDecreaseAccuracy))
+rfs = cache_rds({
+    lapply(1:(nrow(imp)-1), function(i) {
+        vars = rownames(imp)[1:i]    
+        usrf(test1[,vars,drop=F], ntree=10000)
+    })
+})
+rfs = c(rfs, list(irisbc_rf))
+```
+```{r plot_irisbc_varReduct_AIC}
+y_true = rfs[[1]]$y
+tmp = bind_rows(lapply(seq_along(rfs), function(i) {
+   aic_obs = clfAIC(y_true[1:(length(y_true)/2)], 
+                      y_pred=rfs[[i]]$votes[1:(length(y_true)/2),], k=i)
+   aic = clfAIC(y_true, y_pred=rfs[[i]]$votes, k=i)
+   err = rfs[[i]]$err.rate[10000, 1]
+   vars = nrow(importance(rfs[[i]]))
+   data.frame(AIC=aic, AIC_obs=aic_obs, error=err, nvars=vars)
+})) %>% 
+    mutate(across(!nvars, ~ .x / max(.x))) %>%
+    pivot_longer(!c(nvars)) %>%
+    group_by(name) %>%
+    mutate(is.min = value == min(value))
+
+ggplot(tmp) +
+    aes(x=nvars, y=value, color=name) +
+    geom_line(alpha=0.5) +
+    geom_point(aes(shape=is.min), alpha=0.5) +
+    scale_color_brewer(name="", palette="Dark2") +
+    scale_x_continuous(name="Number of variables", breaks=scales::breaks_pretty(6),
+                       sec.axis = sec_axis(~ . * 1, breaks=1:nrow(imp), labels=rownames(imp))) +
+    ylim(0, 1) +
+    ylab("Relative value") +
+    theme_minimal() +
+    theme(axis.text.x.top = element_text(angle=60, vjust=0, hjust=0))
+```
+
+```{r irisbc_aic_with_clusters}
+clus = as.data.frame(ibc.umap$layout)
+clus$cluster = opt$cluster
+#clus
+add_rfs = cache_rds({
+    lapply(1:2, function(i) {
+        vars = rownames(clus)[clus$cluster == i]    
+        usrf(test1[,vars,drop=F], ntree=10000, seed=41)
+})}, rerun=F, clean=T)
+
+tmp2 = bind_rows(lapply(seq_along(add_rfs), function(i) {
+   rf = add_rfs[[i]]
+   vars = nrow(importance(rf))
+   aic_obs = clfAIC(y_true[1:(length(y_true)/2)], 
+                      y_pred=rf$votes[1:(length(y_true)/2),], k=vars)
+   aic = clfAIC(y_true, y_pred=rf$votes, k=vars)
+   err = rf$err.rate[10000, 1]
+   data.frame(AIC=aic, AIC_obs=aic_obs, error=err, nvars=vars)
+}))
+tmp = bind_rows(lapply(seq_along(rfs), function(i) {
+   vars = nrow(importance(rfs[[i]]))
+   aic_obs = clfAIC(y_true[1:(length(y_true)/2)], 
+                      y_pred=rfs[[i]]$votes[1:(length(y_true)/2),], k=vars)
+   aic = clfAIC(y_true, y_pred=rfs[[i]]$votes, k=vars)
+   err = rfs[[i]]$err.rate[10000, 1]
+   data.frame(AIC=aic, AIC_obs=aic_obs, error=err, nvars=vars)
+}))
+
+tmp2$AIC = tmp2$AIC / max(tmp$AIC)
+tmp2$AIC_obs = tmp2$AIC_obs / max(tmp$AIC_obs)
+tmp2$error = tmp2$error / max(tmp$error)
+
+tmp = tmp %>% 
+    mutate(across(!nvars, ~ .x / max(.x))) %>%
+    pivot_longer(!c(nvars)) %>%
+    group_by(name) %>%
+    mutate(is.min = value == min(value))
+tmp2 = tmp2 %>% 
+    pivot_longer(!c(nvars)) %>%
+    mutate(is.min=F) %>%
+    filter(value <= 1)
+
+ggplot(tmp) +
+    geom_line(aes(x=nvars, y=value, color=name), alpha=0.5) +
+    geom_point(aes(x=nvars, y=value, color=name, shape=is.min), alpha=0.5) +
+    scale_color_brewer(name="", palette="Dark2") +
+    scale_x_continuous(name="Number of variables", breaks=scales::breaks_pretty(6),
+                       sec.axis = sec_axis(~ . * 1, breaks=1:nrow(imp), labels=rownames(imp))) +
+    ylim(0, 1) +
+    ylab("Relative value") +
+    theme_minimal() +
+    geom_point(data=tmp2, mapping=aes(x=nvars, y=value, color=name), shape=3, size=3) +
+    theme(axis.text.x.top = element_text(angle=60, vjust=0, hjust=0))
+```

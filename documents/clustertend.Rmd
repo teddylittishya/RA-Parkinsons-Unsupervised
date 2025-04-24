@@ -1,0 +1,1027 @@
+---
+title: "Cluster tendency using unsupervised random forest"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(yfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(randomForest)
+library(glmnet)
+```
+
+# Introduction
+
+Clustering tendency can be measured using the Hopkins statistic, which is bounded between 0 and 1.
+Values near 0.5 indicate that a data set is not clusterable, whereas values between 0.7-1 typically
+indicate that there are clusters.
+
+Here, I extend the Hopkins statistic to utilize unsupervised random forest data such that it can be
+calculated on data sets with multiple data types.
+
+We calculate the Hopkins statistic according to
+
+$$
+H = \frac{\sum_{i=1}^n y_{i}^{d}}{\sum_{i=1}^n y_{i}^{d} + \sum_{i=1}^n x_{i}^{d}},
+$$
+
+where $x_{i}$ is the minimum distance between point $p_{i}$ and any other point, $y_{i}$ is the
+minimum distance between point $q_{i}$ that is randomly sampled from a permuted distribution to
+another point from the same permuted distribution, and $d$ is the dimensionality of the data.
+
+Note, this statistic can be extended to the $k$th nearest neighbor rather than the nearest neighbor
+as described above. This is implemented in the `hopkins` package.
+
+I cannot access this file, but according to many dubious online sources that seem to have
+referenced it (or propagated a quote from it), a Hopkins statistic (for their simulations with a
+given size) of 0.75 or higher indicates clusters with a 90% confidence.
+
+## Example graphs
+
+```{r iris_hopkins_graph, fig.height=5, fig.width=7}
+set.seed(42)
+tmp = iris[,3:4] %>%
+    slice_sample(n=10) %>%
+    mutate(color=0)
+tmp$color[2] = 1
+p1 = ggplot(tmp) + 
+    geom_segment(x=tmp[,1][2] + 0.05, y=tmp[,2][2], xend=tmp[,1][3] - 0.05, yend=tmp[,2][3],
+                 arrow=arrow(length=unit(0.2, 'cm'), ends='both'), color="grey80") +
+    geom_text(x=mean(tmp[2:3,1]), y=mean(tmp[2:3,2]) + 0.05, 
+              label=deparse(bquote(italic(x)[i])), parse=T) +
+    geom_text(x=tmp[2,1], y=tmp[,2][2] - 0.05, 
+              label=deparse(bquote(italic(p)[i])), parse=T) +
+    geom_point(aes(x=Petal.Length, y=Petal.Width, color=factor(color))) +
+    scale_color_manual(values=c('grey40', 'darkred'), guide='none') +
+    ggtitle('Real data - Iris') +
+    theme_minimal()
+tmp2 = data.frame(Petal.Length=runif(n=10, min=min(tmp[,1]), max=max(tmp[,1])),
+                  Petal.Width=runif(n=10, min=min(tmp[,2]), max=max(tmp[,2])),
+                  color=0)
+tmp2$color[2] = 1
+p2 = ggplot(tmp2) + 
+    geom_segment(x=tmp2[2,1], y=tmp2[2,2] + 0.03, xend=tmp2[6,1], yend=tmp2[6,2] - 0.03,
+                 arrow=arrow(length=unit(0.2, 'cm'), ends='both'), color="grey80") +
+    geom_text(x=mean(tmp2[c(2,6),1]) + 0.1, y=mean(tmp2[c(2,6),2]), 
+              label=deparse(bquote(italic(y)[i])), parse=T) +
+    geom_text(x=tmp2[2,1], y=tmp2[,2][2] - 0.05, 
+              label=deparse(bquote(italic(p)[i])), parse=T) +
+    geom_point(aes(x=Petal.Length, y=Petal.Width, color=factor(color))) +
+    scale_color_manual(values=c('grey40', 'darkred'), guide='none') +
+    ggtitle('Randomly sampled data') +
+    theme_minimal()
+p1 + p2
+```
+
+# Random forest Hopkins statistic
+
+```{r Hopkins.rf, class.source='fold-show'}
+Hopkins.rf = function(x, k=1, prop=0.2, seed=42, ntree=1000) {
+    if(!is.null(seed)) set.seed(seed)
+    x_true = x %>%
+        slice_sample(prop=prop)
+    n = nrow(x_true)
+    d = ncol(x_true)
+    rf = randomForest(x=x_true, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    x_i = (1 - apply(prox, 1, function(.x) sort(.x, partial=(n - k + 1))[(n - k + 1)]))^d
+
+    x_fake = x %>%
+        mutate(across(everything(), ~ sample(.x, size=nrow(x)))) %>%
+        slice_sample(prop=prop)
+    rf = randomForest(x=x_fake, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    y_i = (1 - apply(prox, 1, function(.x) sort(.x, partial=(n - k + 1))[(n - k + 1)]))^d
+
+    sum(y_i) / (sum(x_i) + sum(y_i))
+}
+```
+```{r Hopkins.rf2}
+Hopkins.rf2 = function(x, k=1, prop=0.2, seed=42, ntree=1000) {
+    if(!is.null(seed)) set.seed(seed)
+    x_true = x %>%
+        slice_sample(prop=prop)
+    n = nrow(x_true)
+    d = ncol(x_true)
+    rf = randomForest(x=x_true, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    x_i = (1 - apply(prox, 1, function(.x) sort(.x, partial=(n - k + 1))[(n - k + 1)]))
+
+    x_fake = x %>%
+        mutate(across(everything(), ~ sample(.x, size=nrow(x)))) %>%
+        slice_sample(prop=prop)
+    rf = randomForest(x=x_fake, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    y_i = (1 - apply(prox, 1, function(.x) sort(.x, partial=(n - k + 1))[(n - k + 1)]))
+
+    list(y_i=y_i, x_i=x_i)
+}
+```
+
+# Tests on iris
+
+Comparison to the `Hopkins` package
+
+```{r hopkins_iris_comparison}
+tmp = iris[, 1:4] %>% scale()
+vals = cache_rds({
+    sapply(1:200, function(s) {
+        c(Hopkins.rf(iris[,1:4], k=1, prop=0.2, seed=s), 
+          hopkins::hopkins(tmp, m=ceiling(0.2*nrow(iris)), k=1))
+    })
+}, rerun=F, clean=T)
+vals = setNames(data.frame(t(vals)), c('hopkins.rf', 'hopkins')) %>%
+    pivot_longer(everything()) 
+```
+```{r plot_hopkins_iris_comparison, fig.height=4}
+ggplot(vals) +
+    geom_density(aes(x=value, color=name, fill=name), alpha=0.5) +
+    scale_color_brewer(name="", palette='Dark2') +
+    scale_fill_brewer(name="", palette='Dark2') +
+    ylab('Density') +
+    scale_x_continuous(name="Hopkins statistic value (200 repetitions)", limits=c(0.4, 1)) +
+    geom_vline(xintercept=0.5, linetype='dashed', color="grey") +
+    theme_minimal()
+```
+
+Observations:
+
+- The `Hopkins.rf` statistic is always greater than 0.5, suggesting that there is more clustering
+  than at random
+- However, the values are much smaller than those given by the `hopkins` package, indicating that
+  we cannot use the same metric as used to measure the `hopkins` statistic calculated via euclidean
+  distance
+
+
+
+# Testing the Beta(m, m) distribution
+
+The `hopkins` package in CRAN states 
+
+> Under null hypothesis of spatial randomness, Hopkins statistic has a Beta(m,m) distribution, 
+> where ’m’ is the number of events/points sampled. This function calculates the p-value for the
+> statistic.
+
+This sections tests if this is true for randomly generated data of either continuous or discrete
+data using the Hopkins statistic code generated here.
+
+## Varying m
+
+Here, we vary $m$, the number of points sampled for the statistic on completely randomized data
+(with constant $d=4$ dimensions). We expect the value of the rf Hopkins statistic to be centered
+around 0.5.
+
+```{r beta_test1}
+betavals1 = cache_rds({
+    sapply(1:200, function(s) {
+        set.seed(s)
+        iris_fake = iris[,1:4] %>%
+            mutate(across(everything(), ~ sample(.x, size=nrow(iris)))) 
+        c(
+            p01 = Hopkins.rf(iris_fake, seed=s, prop=0.1), # m = 150 * 0.2 = 15
+            p02 = Hopkins.rf(iris_fake, seed=s, prop=0.2), # m = 150 * 0.2 = 30
+            p03 = Hopkins.rf(iris_fake, seed=s, prop=0.3), # m = 150 * 0.3 = 45
+            p04 = Hopkins.rf(iris_fake, seed=s, prop=0.4), # m = 150 * 0.4 = 60
+            p05 = Hopkins.rf(iris_fake, seed=s, prop=0.5) # m = 150 * 0.4 = 75
+        )
+    })
+}, rerun=F, clean=T)
+vals = data.frame(t(betavals1)) %>%
+    pivot_longer(everything()) %>%
+    mutate(name = case_match(name,
+               'p01' ~ '15',
+               'p02' ~ '30',
+               'p03' ~ '45',
+               'p04' ~ '60',
+               'p05' ~ '75'))
+```
+```{r plot_beta_test1, fig.height=4, fig.width=6}
+ggplot(vals) +
+    geom_density(aes(x=value, color=name, fill=name), alpha=0.5) +
+    scale_color_brewer(name=bquote(italic(m)), palette='Dark2') +
+    scale_fill_brewer(name=bquote(italic(m)), palette='Dark2') +
+    ylab('Density') +
+    scale_x_continuous(name="RF Hopkins statistic value (200 repetitions)", limits=c(0.1, 0.9)) +
+    geom_vline(xintercept=0.5, linetype='dashed', color="grey") +
+    theme_minimal()
+```
+
+Observations:
+
+- It still seems that smaller values of $m$ produce a wider tail.
+- The rf Hopkins statistic appears to still follow a symmetric bell curve distribution, which
+  suggests that the Beta distribution is a good fit (with shape 1 = shape 2)
+- The parameterization of the Beta distribution using rf Hopkins and traditional Hopkins may be
+  different.
+
+```{r qqplot_funcs}
+qqplot1 = function(expected, observed, title="") {
+    lim = range(c(expected, observed))
+    ggplot() +
+        geom_point(aes(x=expected, y=observed)) +
+        geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+        theme_minimal() +
+        ggtitle(title) +
+        coord_fixed() +
+        xlim(lim) +
+        ylim(lim)
+}
+qqplot2 = function(expected, observed, title="") {
+    observed = observed - expected
+    lim = max(abs(observed))
+    lim = c(-lim, lim)
+    ggplot() +
+        geom_point(aes(x=expected, y=observed)) +
+        geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+        theme_minimal() +
+        ggtitle(title) +
+        geom_hline(yintercept=0, linetype='dashed', color="grey") +
+        ylim(lim) +
+        ylab("Residuals") 
+}
+```
+```{r betatest1_qqplot, fig.height=4.5}
+# qbeta(p, 15, 15)
+p = ((1:200)/200 - 1/400)
+mvals = c(15, 30, 45, 60, 75)
+plots = lapply(seq_along(mvals), function(i) {
+    qqplot1(
+        observed=sort(betavals1[i,]),
+        expected=qbeta(p, mvals[i], mvals[i]),
+        title=bquote(italic(m) == .(mvals[i]))
+    )
+})
+wrap_plots(plots, ncol=3)
+
+plots = lapply(seq_along(mvals), function(i) {
+    qqplot2(
+        observed=sort(betavals1[i,]),
+        expected=qbeta(p, mvals[i], mvals[i]),
+        title=bquote(italic(m) == .(mvals[i]))
+    )
+})
+wrap_plots(plots, ncol=3)
+```
+
+Plotting the QQ plots against the parameterization in the `hopkins` package suggests that the
+Beta(m, m) distribution does not fit well for the rf Hopkins statistic. It is close, but there is
+a slight consistent overestimate at the lower tail, and underestimate at the upper tail.
+
+I can estimate the empirical parameters of the Beta distribution using the maximum likelihood
+estimator. It is conveniently implemented in the `EnvStats` package.
+
+```{r empirical_beta_params, fig.height=4, fig.width=4, eval=T}
+tmp = data.frame(t(sapply(1:nrow(betavals1), function(i) {
+    EnvStats::ebeta(betavals1[i,], method='mle')$parameters
+})))
+tmp$mvals = mvals
+tmp$est_shape = (tmp$shape1 + tmp$shape2) / 2
+
+ggplot(tmp) +
+    aes(x=mvals, y=est_shape) +
+    geom_point() +
+    ggrepel::geom_text_repel(aes(label=paste0('(', mvals, ', ', round(est_shape), ')',
+                                              '\ns/m = ', round(est_shape/mvals, 2))),
+                             size=3) +
+    xlab(bquote(italic(m))) +
+    ylab("Estimated Beta shape 1/2 parameter") +
+    theme_minimal()
+```
+
+The rf Hopkins statistic appears to approximately follow a $Beta(1.5m, 1.5m)$ distribution.
+This varies a bit at $m=15$ and $m=75$. I would likely need more samples to confirm this.
+
+## Varying d
+
+The `hopkins` package in CRAN further states that
+
+>  The distribution of Hopkins statistic is Beta(m,m), independent of the dimensionality of the
+>  data d.
+
+I test this claim for the rf Hopkins statistic here by varying $d$ while keeping $m$ constant at
+30.
+
+```{r beta_test2}
+dvals = c(4, 5, 10, 15, 20, 100)
+betavals2 = cache_rds({
+    sapply(1:200, function(s) {
+        sapply(dvals, function(d) {
+            set.seed(s)
+            tmp = do.call("data.frame", lapply(1:d, function(.x) runif(n=30)))
+            Hopkins.rf(tmp, seed=s, prop=1)
+        })
+    })
+}, rerun=F, clean=T)
+vals = setNames(data.frame(t(betavals2)), as.character(dvals)) %>%
+    pivot_longer(everything()) %>%
+    mutate(name=factor(name, levels=dvals))
+```
+```{r plot_beta_test2, fig.height=4, fig.width=6}
+ggplot(vals) +
+    geom_density(aes(x=value, color=name, fill=name), alpha=0.5) +
+    scale_color_brewer(name=bquote(italic(d)), palette='Dark2') +
+    scale_fill_brewer(name=bquote(italic(d)), palette='Dark2') +
+    ylab('Density') +
+    scale_x_continuous(name="RF Hopkins statistic value (200 repetitions)", limits=c(0, 1)) +
+    geom_vline(xintercept=0.5, linetype='dashed', color="grey") +
+    theme_minimal()
+```
+
+The plot above strongly suggests that the rf Hopkins statistic is dependent on the number of
+dimensions $d$.
+
+```{r beta_test3}
+betavals3 = cache_rds({
+    lapply(dvals, function(d) {
+        lapply(1:200, function(s) {
+            set.seed(s)
+            tmp = do.call("data.frame", lapply(1:d, function(.x) runif(n=30)))
+            Hopkins.rf2(tmp, seed=s, prop=1)
+        })
+    })
+}, rerun=F, clean=T)
+```
+
+It may be that taking the distance to the power of $d$ is too extreme when using rf Hopkins. I can
+test if a smaller power (e.g., $x_{i}^{d/2}$) yeilds a better distribution.
+
+Here, I iterate over possible powers for the distance using rf Hopkins, and find the best power
+given a true dimensionality for a data set (using the $Beta(m, m)$ distribution as a target
+distribution).
+
+```{r adj_hopstat}
+hopcalc = function(obj, d=1) {
+    y_i = obj$y_i^d
+    x_i = obj$x_i^d
+    sum(y_i) / (sum(x_i) + sum(y_i))
+}
+target_dist = qbeta(p, shape1=30, shape2=30)
+comp_dists = function(x, x_target) {
+    sum(abs(x - x_target))
+}
+test_d = function(i, print.out=T) {
+    d = dvals[i]
+    if(d < 50) {
+        power = seq(d/2, d*2, length.out=20)
+    } else {
+        power = seq(10, d/2, length.out=50)
+    }
+    tmp = sapply(power, function(dt) {
+        tmp = sapply(1:200, function(s) hopcalc(betavals3[[i]][[s]], dt))
+        comp_dists(sort(tmp), target_dist)
+    })
+    if(print.out) {
+        return(rbind(sum_diff=tmp, power=power, true_d=d))
+    }
+    power[which.min(tmp)]
+}
+
+dbest = sapply(1:6, test_d, print.out=F)
+tmp = data.frame(actual_dimensionality=dvals, best_power=dbest)
+tmp
+```
+
+The points look like there's a logarithmic relationship between the actual dimensionality and the
+best power.
+
+```{r adj_hopstat_estimate_power}
+logEstimate = lm(best_power ~ log(actual_dimensionality), data=tmp)
+summary(logEstimate)
+```
+```{r adj_power_plot, warning=F}
+ggplot(tmp) +
+    aes(x=actual_dimensionality, y=best_power) +
+    geom_point() +
+    stat_smooth(method='lm', formula=y~ log(x), fullrange=TRUE) +
+    xlab("Actual dimensionality of data set") +
+    ylab("Power that makes Hopkins statistic follow a Beta distribution") +
+    xlim(0, 100) +
+    ylim(0, 23) +
+    theme_minimal()
+```
+
+The very high R squared suggests that the logarithmic model is a good fit.
+
+This would suggest that a better formulation of the Hopkins statistic using random forest distance
+might be given by:
+
+<details><summary>Unknown power H</summary>
+$$
+H = \frac{\sum_{i=1}^n y_{i}^{?}}{\sum_{i=1}^n y_{i}^{?} + \sum_{i=1}^n x_{i}^{?}}
+$$
+</details>
+
+
+$$
+\begin{equation}
+H_\textrm{rf} = \frac{\sum_{i=1}^n y_{i}^{5.332\log{d} - 2.425}}
+{\sum_{i=1}^n y_{i}^{5.332\log{d} - 2.425} + \sum_{i=1}^n x_{i}^{5.332\log{d} - 2.425}}.
+\end{equation}
+$$
+
+This is only empirical shown, and does not take into context if there's a further effect
+depending on $m$ or $ntree$.
+
+This may also suggest that the reason why the Beta distribution was slightly off in section 4.1 is
+the bias in $d$.
+
+
+## Varying m with new formulation
+
+Given the results of the previous two sections. I want to test if the new formulation generated in
+section 4.2 works across values of $m$ (equation 1).
+
+```{r Hopkins.rf3}
+Hopkins.rf3 = function(x, k=1, prop=0.2, seed=42, ntree=1000) {
+    if(!is.null(seed)) set.seed(seed)
+    x_true = x %>%
+        slice_sample(prop=prop)
+    n = nrow(x_true)
+    d = 5.332*log(ncol(x_true)) - 2.425
+    rf = randomForest(x=x_true, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    x_i = (1 - apply(prox, 1, function(.x) sort(.x, partial=(n - k + 1))[(n - k + 1)]))^d
+
+    x_fake = x %>%
+        mutate(across(everything(), ~ sample(.x, size=nrow(x)))) %>%
+        slice_sample(prop=prop)
+    rf = randomForest(x=x_fake, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    y_i = (1 - apply(prox, 1, function(.x) sort(.x, partial=(n - k + 1))[(n - k + 1)]))^d
+
+    sum(y_i) / (sum(x_i) + sum(y_i))
+}
+```
+
+```{r beta_test4, fig.height=4, fig.width=6}
+betavals4 = cache_rds({
+    sapply(1:200, function(s) {
+        set.seed(s)
+        tmp = do.call("data.frame", lapply(1:10, function(.x) runif(n=75)))
+        c(
+            m15 = Hopkins.rf3(tmp, seed=s, prop=0.2), # m = 75 * 0.2 = 15
+            m30 = Hopkins.rf3(tmp, seed=s, prop=0.4), # m = 75 * 0.2 = 30
+            m45 = Hopkins.rf3(tmp, seed=s, prop=0.6), # m = 75 * 0.3 = 45
+            m60 = Hopkins.rf3(tmp, seed=s, prop=0.8), # m = 75 * 0.4 = 60
+            m75 = Hopkins.rf3(tmp, seed=s, prop=1.0) # m = 75 * 0.4 = 75
+        )
+    })
+}, rerun=F, clean=T)
+vals = data.frame(t(betavals4)) %>%
+    pivot_longer(everything()) %>%
+    mutate(name=gsub('m', '', name))
+ggplot(vals) +
+    geom_density(aes(x=value, color=name, fill=name), alpha=0.5) +
+    scale_color_brewer(name=bquote(italic(m)), palette='Dark2') +
+    scale_fill_brewer(name=bquote(italic(m)), palette='Dark2') +
+    ylab('Density') +
+    scale_x_continuous(name="RF Hopkins statistic value (200 repetitions)", limits=c(0, 1)) +
+    geom_vline(xintercept=0.5, linetype='dashed', color="grey") +
+    theme_minimal()
+```
+
+This distributions across values of $m$ is as expected, with higher values of $m$ having smaller
+tails.
+
+```{r betatest4_qqplot, fig.height=4.5}
+p = ((1:200)/200 - 1/400)
+mvals = c(15, 30, 45, 60, 75)
+plots = lapply(seq_along(mvals), function(i) {
+    betavals4 = data.frame(
+        observed=sort(betavals4[i,]),
+        expected=qbeta(p, mvals[i], mvals[i]))
+    lim = range(c(betavals4$observed, betavals4$expected))
+    ggplot(betavals4) +
+        geom_point(aes(x=observed, y=expected)) +
+        geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+        theme_minimal() +
+        ggtitle(bquote(italic(m) == .(mvals[i]) ~ ',' ~ italic(d) == .(10))) +
+        coord_fixed() +
+        xlim(lim) +
+        ylim(lim)
+})
+wrap_plots(plots, ncol=3)
+```
+
+The dispersion appears to be underestimated (very) slightly at lower values of $m$, and
+overestimated at higher values of $m$. We can see that the tails appear most even at $m=30$. Given
+that we calculated values for the reformulation while fixing $m = 30$ in section 4.2, this might be
+expected. The differences in the distribution are very slight.
+
+<details><summary>same results with d=4</summary>
+```{r beta_test5, fig.height=4, fig.width=6}
+betavals5 = cache_rds({
+    sapply(1:200, function(s) {
+        set.seed(s)
+        tmp = do.call("data.frame", lapply(1:4, function(.x) runif(n=75)))
+        c(
+            m15 = Hopkins.rf3(tmp, seed=s, prop=0.2), # m = 75 * 0.2 = 15
+            m30 = Hopkins.rf3(tmp, seed=s, prop=0.4), # m = 75 * 0.2 = 30
+            m45 = Hopkins.rf3(tmp, seed=s, prop=0.6), # m = 75 * 0.3 = 45
+            m60 = Hopkins.rf3(tmp, seed=s, prop=0.8), # m = 75 * 0.4 = 60
+            m75 = Hopkins.rf3(tmp, seed=s, prop=1.0) # m = 75 * 0.4 = 75
+        )
+    })
+}, rerun=F, clean=T)
+```
+```{r beta_test5_qqplot, fig.height=4.5}
+mvals = c(15, 30, 45, 60, 75)
+plots = lapply(seq_along(mvals), function(i) {
+    betavals5 = data.frame(
+        observed=sort(betavals5[i,]),
+        expected=qbeta(p, mvals[i], mvals[i]))
+    lim = range(c(betavals5$observed, betavals5$expected))
+    ggplot(betavals5) +
+        geom_point(aes(x=observed, y=expected)) +
+        geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+        theme_minimal() +
+        ggtitle(bquote(italic(m) == .(mvals[i]) ~ ',' ~ italic(d) == 4)) +
+        coord_fixed() +
+        xlim(lim) +
+        ylim(lim)
+})
+wrap_plots(plots, ncol=3)
+```
+</details>
+
+## Full parameter sweep over d and m
+
+Because it appears that the null distribution of $H_{rf}$ is dependent on both $d$ and $m$, I
+conduct a full parameter sweep over values of $d$ and $m$.
+
+We vary $d \in (5, 10, 20, 50, 100)$ and $m \in (5, 10, 20, 50, 100)$.
+
+```{r beta_test6}
+dvals = c(5, 10, 20, 50, 100, 200)
+mvals = c(5, 10, 20, 50, 100, 200)
+
+betavals6 = cache_rds({
+    lapply(dvals, function(d) {
+        ic(d, " out of ", dvals, "\n")
+        set.seed(42)
+        tmp = do.call("data.frame", lapply(1:d, function(.x) runif(n=max(mvals))))
+        lapply(mvals, function(m) {
+            lapply(1:200, function(s) {
+                set.seed(s)
+                Hopkins.rf2(tmp, seed=s, prop=m/max(mvals))
+            })
+        })
+    })
+}, rerun=F, clean=T)
+```
+```{r beta_test6_collectdata, summary=T}
+test_power = function(i, j, print.out=T) {
+    d = dvals[i]
+    m = mvals[j]
+    test_powers = (log(d)*seq(2, 10, length.out=100)) - 2.425
+    target_dist = qbeta(p, shape1=m, shape2=m)
+    tmp = sapply(test_powers, function(dt) {
+        tmp = sapply(1:200, function(s) hopcalc(betavals6[[i]][[j]][[s]], dt))
+        comp_dists(sort(tmp), target_dist)
+    })
+    if(print.out) {
+        return(rbind(sum_diff=tmp, power=test_powers, true_d=d))
+    }
+    data.frame(d=d, m=m, best_power=test_powers[which.min(tmp)])
+}
+tmp = cache_rds({
+    bind_rows(lapply(1:6, function(i) 
+                     bind_rows(lapply(1:6, function(j) test_power(i, j, print.out=F)))))
+}, rerun=T, clean=T)
+tmp
+```
+
+```{r logfits}
+logfit = function(dat, title="") {
+    logEstimate = lm(best_power ~ log(d), data=dat)
+    ggplot(dat) +
+        aes(x=d, y=best_power) +
+        geom_point() +
+        stat_smooth(method='lm', formula=y~log(x), fullrange=TRUE) +
+        geom_text(x=mean(range(dat$d)), y=mean(range(dat$best_power)), 
+                  label=deparse(bquote(atop(
+                      .(round(coef(logEstimate)[[2]], 2))~log(d) + .(round(coef(logEstimate)[[1]], 2)),
+                      italic(R)^2 == .(round(summary(logEstimate)$r.squared, 3))
+                  ))), parse=T) +
+        ggtitle(title) +
+        xlab("d") +
+        ylab("Best Power") +
+        theme_minimal()
+}
+plots = lapply(mvals, function(m) logfit(tmp[tmp$m==m,], bquote(italic(m) == .(m))))
+
+wrap_plots(plots, ncol=3, axis_titles="collect")
+```
+
+```{r print_logfits, summary=T}
+logfit2 = function(dat) {
+    logEstimate = lm(best_power ~ log(d), data=dat)
+    list(summary(logEstimate), confint(logEstimate))
+}
+lapply(mvals, function(m) logfit2(tmp[tmp$m==m,]))
+```
+
+```{r all_points_plot}
+ggplot(tmp) +
+    geom_point(aes(x=d, y=best_power, color=factor(m)), alpha=0.5) +
+    geom_line(aes(x=d, y=best_power, color=factor(m)), alpha=0.5) +
+    scale_color_brewer(name="m", palette="Dark2") +
+    xlab("d") +
+    ylab("Best Power") +
+    theme_minimal()
+```
+
+```{r lasso_full_param_sweep, summary=T}
+y = tmp$best_power
+f <- as.formula(y ~ .*.)
+x = tmp %>%
+    select(d, m) %>%
+    mutate(logm = log(m), 
+           logd = log(d), 
+           mtry = floor(sqrt(d)),
+           sqrtd = sqrt(d),
+           cbrtd = d^(1/3),
+           sqrtm = sqrt(m),
+           cbrtm = m^(1/3),
+    ) 
+x <- model.matrix(f, x)[, -1]
+
+lasso = cv.glmnet(x, y, alpha=1, family='gaussian')
+i = which(lasso$lambda == lasso$lambda.1se)
+coef(lasso, s=lasso$lambda.1se, exact=T)
+r2 = 1 - lasso$cvm[i]/var(y)
+cat("r2 = ", round(r2, 3), "\n")
+x = tmp %>%
+    select(d, m, best_power) %>%
+    mutate(logm = log(m), 
+           logd = log(d), 
+           mtry = floor(sqrt(d)),
+           sqrtd = sqrt(d),
+           cbrtd = d^(1/3),
+           sqrtm = sqrt(m),
+           cbrtm = m^(1/3)
+    ) 
+```
+
+Using Lasso, it seems the best fit uses $\log{m}\log{d}$ and an intercept. As well as $d \times m$
+and $m log{d}$, although the last two have very small coefficients. I will see how good of a fit we
+can obtain using just the $\log{d}\log{m}$ interaction.
+
+```{r logm_logd_interaction_only, summary=T}
+lme = lm(y ~ logm:logd + 0, data=x)
+summary(lme)
+```
+
+Using only the interaction term and enforcing no intercept, we get a fit with adjusted $R^2$ of 
+0.961. The idea behind enforcing no intercept is because it makes the formula a bit simpler, and
+prevents negative powers.
+
+```{r adjusted_logm_logd_interaction, fig.height=4, summary=T}
+tmp = x
+tmp$pred = 1.5*tmp$logd*tmp$logm
+
+p1 = ggplot(tmp) +
+    geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+    geom_point(aes(x=best_power, y=pred, color=factor(m)), alpha=0.5) +
+    geom_line(aes(x=best_power, y=pred, color=factor(m)), alpha=0.5) +
+    scale_color_brewer(name="m", palette="Dark2") +
+    xlab("Best power") +
+    ylab("Predicted power") +
+    coord_fixed() +
+    theme_minimal()
+p2 = ggplot(tmp) +
+    geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+    geom_point(aes(x=best_power, y=pred, color=factor(d)), alpha=0.5) +
+    geom_line(aes(x=best_power, y=pred, color=factor(d)), alpha=0.5) +
+    scale_color_brewer(name="d", palette="Set2") +
+    xlab("Best power") +
+    ylab("Predicted power") +
+    coord_fixed() +
+    theme_minimal()
+p1 + p2
+```
+
+```{r adjusted_cube_root_m_logd_interaction, fig.height=4, summary=T}
+tmp$pred = 1.49*tmp$cbrtm*tmp$logd
+
+p1 = ggplot(tmp) +
+    geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+    geom_point(aes(x=best_power, y=pred, color=factor(m)), alpha=0.5) +
+    geom_line(aes(x=best_power, y=pred, color=factor(m)), alpha=0.5) +
+    scale_color_brewer(name="m", palette="Dark2") +
+    xlab("Best power") +
+    ylab("Predicted power") +
+    coord_fixed() +
+    theme_minimal()
+p2 = ggplot(tmp) +
+    geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+    geom_point(aes(x=best_power, y=pred, color=factor(d)), alpha=0.5) +
+    geom_line(aes(x=best_power, y=pred, color=factor(d)), alpha=0.5) +
+    scale_color_brewer(name="d", palette="Set2") +
+    xlab("Best power") +
+    ylab("Predicted power") +
+    coord_fixed() +
+    theme_minimal()
+p1 + p2
+```
+
+```{r adjusted_cube_root_m_square_root_d_interaction, fig.height=4, summary=T}
+tmp$pred = 0.6846*tmp$cbrtm*tmp$sqrtd
+
+p1 = ggplot(tmp) +
+    geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+    geom_point(aes(x=best_power, y=pred, color=factor(m)), alpha=0.5) +
+    geom_line(aes(x=best_power, y=pred, color=factor(m)), alpha=0.5) +
+    scale_color_brewer(name="m", palette="Dark2") +
+    xlab("Best power") +
+    ylab("Predicted power") +
+    coord_fixed() +
+    theme_minimal()
+p2 = ggplot(tmp) +
+    geom_abline(slope=1, intercept=0, linetype='dashed', color="grey") +
+    geom_point(aes(x=best_power, y=pred, color=factor(d)), alpha=0.5) +
+    geom_line(aes(x=best_power, y=pred, color=factor(d)), alpha=0.5) +
+    scale_color_brewer(name="d", palette="Set2") +
+    xlab("Best power") +
+    ylab("Predicted power") +
+    coord_fixed() +
+    theme_minimal()
+p1 + p2
+```
+
+The values are fairly close. This yields a final formulation of
+
+$$
+\begin{equation}
+H_\textrm{rf} = \frac{\sum_{i=1}^n y_{i}^{1.5\log{d}\log{m}}}
+{\sum_{i=1}^n y_{i}^{1.5\log{d}\log{m}} + \sum_{i=1}^n x_{i}^{1.5\log{d}\log{m}}}.
+\end{equation}
+$$
+
+# Final Formulation
+
+```{r hoprf4}
+Hopkins.rf4 = function(x, k=1, m=0.1*nrow(x), seed=42, ntree=1000) {
+    if(!is.null(seed)) set.seed(seed)
+    x_true = x %>% slice_sample(n=m)
+    d = ncol(x_true)
+    rf = randomForest(x=x_true, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    x_i = (1 - apply(prox, 1, function(.x) 
+                     sort(.x, partial=(m - k + 1))[(m - k + 1)]))^(1.5 * log(d) * log(m))
+
+    x_fake = x %>%
+        mutate(across(everything(), ~ sample(.x, size=nrow(x)))) %>%
+        slice_sample(n=m)
+    rf = randomForest(x=x_fake, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    y_i = (1 - apply(prox, 1, function(.x) 
+                     sort(.x, partial=(m - k + 1))[(m - k + 1)]))^(1.5 * log(d) * log(m))
+
+    sum(y_i) / (sum(x_i) + sum(y_i))
+}
+```
+
+```{r hoprf5}
+sample_data_set = function(x, m) {
+    n = nrow(x)
+    x = x %>% mutate(across(everything(), 
+        function(.x) {
+            if(all(.x == 0 | .x == 1)) { # binary
+                return(sample(c(0, 1), size=n, replace=T))
+            } else if(is.numeric(.x)) { # continuous
+                return(runif(n, min=min(.x), max=max(.x)))
+            } else if(is.factor(.x)) { # categorical
+                return(factor(sample(unique(.x), size=n, replace=T)))
+            } else { # other?
+                return(sample(.x, size=n, replace=T))
+            }
+        })) %>%
+        slice_sample(n=m)
+    x
+}
+
+Hopkins.rf5 = function(x, k=1, m=0.1*nrow(x), seed=42, ntree=1000) {
+    if(!is.null(seed)) set.seed(seed)
+    x_true = x %>% slice_sample(n=m)
+    d = ncol(x_true)
+    rf = randomForest(x=x_true, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    x_i = (1 - apply(prox, 1, function(.x) 
+                     sort(.x, partial=(m - k + 1))[(m - k + 1)]))^(1.5 * log(d) * log(m))
+
+    x_fake = sample_data_set(x, m=m) 
+    rf = randomForest(x=x_fake, 
+                      proximity=T, 
+                      keep.forest=F, 
+                      ntree=ntree)
+    prox = rf$proximity
+    diag(prox) = -1
+    y_i = (1 - apply(prox, 1, function(.x) 
+                     sort(.x, partial=(m - k + 1))[(m - k + 1)]))^(1.5 * log(d) * log(m))
+
+    sum(y_i) / (sum(x_i) + sum(y_i))
+}
+```
+
+## Iris test
+
+```{r iris_test_hoprf4, fig.height=4.5, fig.width=6}
+tmp = iris[, 1:4] %>% scale()
+vals = cache_rds({
+    sapply(1:200, function(s) {
+        c(Hopkins.rf4(iris[,1:4], k=1, m=30, seed=s), 
+          Hopkins.rf5(iris[,1:4], k=1, m=30, seed=s),
+          hopkins::hopkins(tmp, m=30, k=1))
+    })
+}, rerun=F, clean=T)
+vals = setNames(data.frame(t(vals)), c('hopkins.rf4', 'hopkins.rf5', 'hopkins')) %>%
+    pivot_longer(everything()) 
+ggplot(vals) +
+    geom_density(aes(x=value, color=name, fill=name), alpha=0.5) +
+    scale_color_brewer(name="", palette='Dark2') +
+    scale_fill_brewer(name="", palette='Dark2') +
+    ylab('Density') +
+    scale_x_continuous(name="Hopkins statistic value (200 repetitions)", limits=c(0.4, 1)) +
+    geom_vline(xintercept=0.5, linetype='dashed', color="grey") +
+    theme_minimal()
+```
+
+<mark>Observations:</mark>
+
+- The values with this new formula are closer to the values produced by the `hopkins` package, but
+  are still not the same distribution.
+- hopkins.rf5 samples data from the hypercube (random uniform for continuous; equal probability for
+  categorical)
+  - it does not yield significantly different results from permutation via hopkins.rf4
+
+## Iris test with random features
+
+We expect the value to decrease as the number of random features are added to the data set.
+
+```{r iris_test_with_noise, fig.height=4.5, fig.width=6}
+add_randfeats = function(x, n, type=c('cont', 'cat'), num.cat=3) {
+    type = match.arg(type)
+    if(type == 'cont') {
+        tmp = do.call('data.frame', 
+                      lapply(1:n, function(.x) runif(n=nrow(x))))
+        colnames(tmp) = paste0('randcontinuous_', 1:n)
+        return(cbind(x, tmp))
+    } else if(type == 'cat') {
+        tmp = do.call('data.frame', 
+                      lapply(1:n, function(.x) factor(sample(1:num.cat, size=nrow(x), replace=T))))
+        colnames(tmp) = paste0('randcategorical_', 1:n)
+        return(cbind(x, tmp))
+    } else {
+        return(x)
+    }
+}
+vals = cache_rds({
+    parallel::mclapply(1:200, function(s) {
+        if(s %% 20 == 0) ic(s)
+        set.seed(s)
+        data.frame(
+          none=Hopkins.rf5(iris[,1:4], k=1, m=30, seed=s),
+          fivefeats_cont=Hopkins.rf5(add_randfeats(iris[,1:4], 5), k=1, m=30, seed=s),
+          tenfeats_cont=Hopkins.rf5(add_randfeats(iris[,1:4], 10), k=1, m=30, seed=s),
+          twentyfeats_cont=Hopkins.rf5(add_randfeats(iris[,1:4], 20), k=1, m=30, seed=s),
+          fivefeats_cat=Hopkins.rf5(add_randfeats(iris[,1:4], 5, type='cat'), k=1, m=30, seed=s),
+          tenfeats_cat=Hopkins.rf5(add_randfeats(iris[,1:4], 10, type='cat'), k=1, m=30, seed=s),
+          twentyfeats_cat=Hopkins.rf5(add_randfeats(iris[,1:4], 20, type='cat'), k=1, m=30, seed=s)
+         )
+    }, mc.cores=4)
+}, rerun=F, clean=T)
+vals = bind_rows(vals) %>%
+    pivot_longer(everything())
+p1 = ggplot(vals %>% filter(name == 'none' | grepl('cont', name))) +
+    geom_density(aes(x=value, color=name, fill=name), alpha=0.5) +
+    scale_color_brewer(name="", palette='Dark2') +
+    scale_fill_brewer(name="", palette='Dark2') +
+    ylab('Density') +
+    scale_x_continuous(name="RF Hopkins statistic value (200 repetitions)", limits=c(0.3, 1)) +
+    geom_vline(xintercept=0.5, linetype='dashed', color="grey") +
+    ggtitle("Random continuous features") +
+    theme_minimal()
+p2 = ggplot(vals %>% filter(name == 'none' | grepl('cat', name))) +
+    geom_density(aes(x=value, color=name, fill=name), alpha=0.5) +
+    scale_color_brewer(name="", palette='Dark2') +
+    scale_fill_brewer(name="", palette='Dark2') +
+    ylab('Density') +
+    scale_x_continuous(name="RF Hopkins statistic value (200 repetitions)", limits=c(0.3, 1)) +
+    geom_vline(xintercept=0.5, linetype='dashed', color="grey") +
+    ggtitle("Random categorical features") +
+    theme_minimal()
+p1 / p2 + plot_layout(axis_titles = 'collect')
+```

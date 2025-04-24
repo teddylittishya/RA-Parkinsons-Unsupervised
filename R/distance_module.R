@@ -1,0 +1,1 @@
+# Take as input a data frame and output a `dist` object

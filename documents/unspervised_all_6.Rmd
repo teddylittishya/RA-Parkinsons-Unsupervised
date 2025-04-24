@@ -1,0 +1,667 @@
+---
+title: "Unspervised tests on multiple datasets"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(randomForest)
+library(reshape2)
+library(ggplot2)
+library(pheatmap)
+library(aricode)
+library(mclust)
+library(ess)
+```
+
+
+```{r clustering_module, class.source='fold-show', summary=T}
+#' Clustering module
+#'
+#' Takes as input a distance matrix and runs clustering algorithms with a given set of parameters.
+#'
+#' @param x distance matrix object of type `dist` with dimensions n x n
+#' @param algo clustering algorithm
+#' @param k_method method for determining the number of clusters (ignored for OPTICS)
+#' @param ... additional arguments depending on the choice of `algo`
+#'  - For 'OPTICS': 
+#'     \itemize{
+#'       \item \code{minPts}: Minimum number of points in a neighborhood for a point to be considered a core point.
+#'       \item \code{xi}: Minimum reachability distance for clustering.
+#'     }
+#'   - For 'kmeans': 
+#'     \itemize{
+#'       \item \code{k}: Number of clusters or initial cluster centers.
+#'     }
+#'   - For 'hierarchical': 
+#'     \itemize{
+#'       \item \code{agg_method}: Linkage method ('complete', 'single', 'average', etc.) for hierarchical clustering.
+#'       \item \code{k}: Number of clusters to be formed by cutting the dendrogram.
+#'     }
+#' @return vector of length n with cluster memberships
+#' @import dbscan
+#' @import cluster
+#' @export
+#' 
+cluster_module <- function(x, 
+                           algo=c('OPTICS', 'kmeans', 'pam', 'fanny', 'hierarchical', 'agnes', 'diana'),
+                           ...) {
+  algo = match.arg(algo)
+  params <- list(...)
+  cvec <- vector()
+  switch(algo,
+         'OPTICS' = {
+           # Ordering Points to Identify the Clustering Structure (OPTICS)
+           reach <- dbscan::optics(x, minPts = params$minPts)
+           clusters <- dbscan::extractXi(reach, xi= params$xi, minimum=T)
+           cvec <- clusters$cluster
+         },
+         'kmeans' = {
+           # K-Means Clustering (Partitioning Clustering)
+           clusters <- stats::kmeans(x, centers = params$k)
+           cvec <- clusters$cluster
+         },
+         'pam' = {
+           # Partitioning Around Medoids (Partitioning Clustering)
+           clusters <- cluster::pam(x, k = params$k)
+           cvec <- clusters$clustering
+         },
+         'fanny' = {
+           # Fuzzy Analysis Clustering (Partitioning Clustering)
+           clusters <- cluster::fanny(x, k = params$k, maxit=1000)
+           cvec <- clusters$clustering
+         },
+         'hierarchical' = {
+           # Hierarchical Clustering
+           switch(params$agg_method,
+                  'average' = {
+                    clusters <- stats::hclust(x, method = "average")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'single' = {
+                    clusters <- stats::hclust(x, method = "single")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'complete' = {
+                    clusters <- stats::hclust(x, method = "complete")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'ward' = {
+                    clusters <- stats::hclust(x, method = "ward.D")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'mcquitty' = {
+                    clusters <- stats::hclust(x, method = "mcquitty")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  })
+         },
+         'agnes' = {
+           # Agglomerative Nesting (Hierarchical Clustering)
+           switch(params$agg_method,
+                  'average' = {
+                    clusters <- cluster::agnes(x, method = "average")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'single' = {
+                    clusters <- cluster::agnes(x, method = "single")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'complete' = {
+                    clusters <- cluster::agnes(x, method = "complete")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'ward' = {
+                    clusters <- cluster::agnes(x, method = "ward")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'mcquitty' = {
+                    clusters <- cluster::agnes(x, method = "weighted")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  })
+         },
+         'diana' = {
+           # Divisive Analysis Clustering (Hierarchical Clustering)
+           clusters <- cluster::diana(x)
+           cvec <- stats::cutree(clusters, k = params$k)
+         },
+         {
+           stop("The argument k_method is required. ", "Possible values are OPTICS, kmeans, pam, fanny, hierarchical, agnes, diana")
+         })
+  return(cvec)
+}
+
+```
+
+```{r evaluation_module, class.source='fold-show', summary=T}
+#' Evaluation module
+#'
+#' Takes as input the cluster memberships produced by a single run of `cluster_module`, and the
+#' parameters used by `cluster_module`. Returns a list of evaluation metrics for that run of
+#' `cluster_module`.
+#'
+#' @param cvec numeric vector of length n with cluster memberships
+#' @param parameter list of parameters used by `cluster_module`
+#' @param supervised boolean indicating whether or not to use supervised learning as a metric of
+#'   cluster quality
+#' @return numeric vector of evaluation metrics including
+#'   - Cohesiveness: Measures how tightly grouped points are within clusters.
+#'   - Separation: Measures how distinct clusters are from each other.
+#'   - Cluster Sizes: Number of data points in each cluster.
+#'   - Other relevant clustering metrics depending on the implementation.
+#' @import fpc
+#' @import clusterSim
+#' @export
+#' 
+evaluation_module <- function(x,
+                              cvec, 
+                              parameter, 
+                              supervised=F) {
+  if(is.null(cvec) | var(cvec) == 0) { 
+      return(list(nbclust=NA,
+                  cohesiveness=NA,
+                  distinctiveness=NA,
+                  n_between=NA,
+                  n_within=NA,
+                  avg_silwidth=NA,
+                  max_diameter=NA,
+                  min_separation=NA,
+                  pearson_gamma=NA,
+                  dunn_index=NA,
+                  dunn2_index=NA,
+                  entropy=NA,
+                  wb_ratio=NA,
+                  ch_index=NA,
+                  widest_gap=NA,
+                  sep_index=NA,
+                  index_C=NA,
+                  index_G2=NA,
+                  index_G3=NA,
+                  index_S=NA
+      )) 
+  }
+  # calculate clustering statistics
+  stats <- fpc::cluster.stats(x, cvec)
+  
+  # prepare output with evaluation metrics
+  out = list(nbclust = stats$cluster.number,
+             cohesiveness = stats$average.within, 
+             # Measures how closely points are grouped within the same cluster.
+             distinctiveness = stats$average.between, 
+             # Measures how well clusters are separated from each other.
+             n_between = stats$n.between,
+             # Indicates the number of between-cluster distance measurements.
+             n_within = stats$n.within,
+             # Indicates the number of within-cluster distance measurements.
+             avg_silwidth = stats$avg.silwidth,
+             #  Provides the average silhouette width, which measures the quality of the clusters.
+             max_diameter = stats$max.diameter,
+             # Measures the greatest distance within two points in a cluster
+             min_separation = stats$min.separation,
+             # Measures the minimum separation between clusters.
+             # gamma_coef = stats$g2,
+             # Represents the gamma coefficient, used to evaluate clustering quality.
+             # g3_coeff = stats$g3,
+             # Represents the g3 coefficient, used to evaluate clustering quality.
+             pearson_gamma = stats$pearsongamma,
+             # Represents the pearson gamma coefficient which assess clustering quality. 
+             dunn_index = stats$dunn,
+             # Evaluates the ratio of minimum inter-cluster distance to maximum intra-cluster distance.
+             dunn2_index = stats$dunn2,
+             # Measures the modified Dunn index.
+             entropy = stats$entropy,
+             # Measures the entropy (distance and homogenity) of the clusters
+             wb_ratio = stats$wb.ratio,
+             # Represents the within-between cluster ratio, used for clustering evaluation.
+             ch_index = stats$ch,
+             # Provides the Calinski-Harabasz index, used to evaluate the dispersion of clusters.
+             widest_gap = stats$widestgap,
+             # Measures the widest gap between clusters.
+             sep_index = stats$sindex,
+             # Represents the separation index, used for clustering evaluation.
+             index_C = clusterSim::index.C(x, cvec),
+             # Calculates Hubert & Levin C index - internal cluster quality index
+             index_G2 = clusterSim::index.G2(x, cvec),
+             # Calculates G2 internal cluster quality index
+             index_G3 = clusterSim::index.G3(x, cvec),
+             # Calculates G3 internal cluster quality index
+             index_S = clusterSim::index.S(x, cvec)
+             # Calculates Rousseeuw’s Silhouette internal cluster quality index
+  )
+  
+  #assign class to output list
+  class(out) = 'evaluation_module'
+  return(out)
+}
+```
+
+```{r run_all_function, class.source='fold-show', summary=T}
+run_all = function(data, 
+                   labels,
+                   k=seq(2, 10), 
+                   agg = c('average','single','complete','ward','mcquitty'),
+                   xi=c(0.01, 0.05, 0.1, 0.2, 0.5), 
+                   minPts=4:10) {
+  data.dist = dist(data, method="euclidean")
+  #data.rf <- randomForest::randomForest(x=data, proximity=TRUE, keep.forest=FALSE, ntree=2000)
+  #data.dist = 1 - data.rf$proximity
+  
+
+    algos = eval(formals(args(cluster_module))$algo)
+    df1 = lapply(k, function(kval) {
+        lapply(algos, function(algo) {
+            if(algo == "OPTICS" | algo == "hierarchical" | algo == "agnes") { return(NULL) }
+            cvec = cluster_module(data.dist, algo=algo, k=kval, agg_method="complete")
+            names(cvec) = paste0("sample",1:length(cvec))
+            c(param.algo=algo, param.k=kval, evaluation_module(data.dist, cvec), 
+             NMI=aricode::NMI(unlist(cvec), labels),
+             ARI=mclust::adjustedRandIndex(unlist(cvec), labels),
+             cvec)
+        })
+    })
+    df1 = bind_rows(unlist(df1, recursive=F))
+    
+    # optics_params = expand.grid(xi=xi, minPts=minPts)
+    # df2 = apply(optics_params, 1, function(row) {
+    #   algo = "OPTICS"
+    #   xival = row[["xi"]]
+    #   mpval = row[["minPts"]]
+    #   cvec = cluster_module(data.dist, algo="OPTICS", xi=xival, minPts=mpval)
+    #   if(is.null(cvec)) cvec = rep(0, nrow(data.dist))
+    #   names(cvec) = paste0("sample",1:length(cvec))
+    #   c(param.algo="OPTICS", param.xi=xival, param.minPts=mpval,
+    #     evaluation_module(data.dist, cvec),
+    #     NMI=aricode::NMI(unlist(cvec), labels),
+    #     ARI=mclust::adjustedRandIndex(unlist(cvec), labels),
+    #     cvec)
+    # })
+    # df2 = bind_rows(df2)
+  
+    
+    df3 = bind_rows(lapply(k, function(kval) {
+      bind_rows(lapply(algos, function(algo) {
+        bind_rows(lapply(agg, function(aggval) {
+         if (algo == "hierarchical" | algo == "agnes") {
+           cvec = cluster_module(data.dist, algo=algo, k=kval, agg_method=aggval)
+           names(cvec) = paste0("sample",1:length(cvec))
+           c(param.algo=algo, param.k=kval, param.agg_method=aggval, 
+             evaluation_module(data.dist, cvec), 
+             NMI=aricode::NMI(unlist(cvec), labels),
+             ARI=mclust::adjustedRandIndex(unlist(cvec), labels),
+             cvec)
+         }
+        }))
+      }))
+    }))
+    
+    # eval <- bind_rows(df1, df2, df3) %>% relocate(starts_with('param'))
+    eval <- bind_rows(df1, df3) %>% relocate(starts_with('param'))
+    # cvec_mat <- do.call(rbind, cvec_val)
+    # out = list(eval.res=eval, cvec_val.res=cvec_val)
+    # class(out) = 'run_module'
+    return(eval)
+}
+```
+
+# Running on Iris
+
+```{r iris_dataset, warning=FALSE, cache=TRUE}
+data(iris)
+dim(iris)
+levels(iris$Species)
+head(iris)
+```
+
+## Display the evaluation indices
+
+```{r run_all_iris, warning=FALSE, cache=TRUE}
+run_output_iris <- run_all(data=iris[1:4], labels=iris$Species)
+eval_res_iris <-  dplyr::select(run_output_iris, !starts_with("sample"))
+reactable(eval_res_iris,
+          columns = list(cohesiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         distinctiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         avg_silwidth = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         max_diameter = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         min_separation = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         pearson_gamma = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn2_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         entropy = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         wb_ratio = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ch_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         widest_gap = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         sep_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         index_C = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G2 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G3 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_S = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         NMI = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ARI = colDef(format = colFormat(locales = "en-US", digits = 4))))
+
+```
+
+## Create a spearman's rank correlation pairwise heatmap to compare all the evaluation metrics
+
+```{r heatmap_iris, warning=FALSE, cache=TRUE}
+# corr_mat <- round(cor(eval_res[,7:ncol(eval_res)], method = "spearman", use = "pairwise.complete.obs"),2)
+corr_mat_iris <- round(cor(dplyr::select(eval_res_iris, !starts_with("param")), 
+                            method = "spearman", use = "pairwise.complete.obs"),2)
+
+melted_corr_mat_iris <- melt(corr_mat_iris)
+
+pheatmap(corr_mat_iris, 
+         display_numbers = TRUE,  # Display correlation values inside cells
+         color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+         main = "Spearman Correlation Heatmap for Evaluation Metrics")
+
+```
+
+## Display top indices correlated to NMI
+
+```{r nmi_corr_iris, warning=FALSE, cache=TRUE}
+melted_corr_mat_iris %>% 
+  filter(Var1 == "NMI" & !Var2 %in% c("NMI","ARI")) %>% 
+  slice_max(value, n=5)
+```
+
+
+## Compare cluster metrics to the true number of classes (k = 3)
+
+```{r iris_k_3, warning=FALSE, cache=TRUE}
+eval_res_iris_k_3 <- eval_res_iris %>% 
+  dplyr::filter(param.k == 3) %>%
+  dplyr::select(!starts_with("param"))
+
+reactable(eval_res_iris_k_3,
+          columns = list(cohesiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         distinctiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         avg_silwidth = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         max_diameter = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         min_separation = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         pearson_gamma = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn2_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         entropy = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         wb_ratio = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ch_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         widest_gap = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         sep_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         index_C = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G2 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G3 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_S = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         NMI = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ARI = colDef(format = colFormat(locales = "en-US", digits = 4))))
+
+```
+
+# Running on Wine dataset
+
+```{r wine_dataset, warning=FALSE, cache=TRUE}
+data(wine)
+dim(wine)
+levels(as.factor(wine$class))
+head(wine)
+```
+
+
+## Display the evaluation metrics
+
+```{r run_all_wine, warning=FALSE, cache=TRUE}
+run_output_wine <- run_all(data=wine, labels=wine$class)
+eval_res_wine <-  dplyr::select(run_output_wine, !starts_with("sample"))
+reactable(eval_res_wine,
+          columns = list(cohesiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         distinctiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         avg_silwidth = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         max_diameter = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         min_separation = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         pearson_gamma = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn2_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         entropy = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         wb_ratio = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ch_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         widest_gap = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         sep_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         index_C = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G2 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G3 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_S = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         NMI = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ARI = colDef(format = colFormat(locales = "en-US", digits = 4))))
+
+```
+
+
+## Create a spearman's rank correlation pairwise heatmap to compare all the evaluation metrics
+
+```{r heatmap_wine, warning=FALSE, cache=TRUE}
+# corr_mat <- round(cor(eval_res[,7:ncol(eval_res)], method = "spearman", use = "pairwise.complete.obs"),2)
+corr_mat_wine <- round(cor(dplyr::select(eval_res_wine, !starts_with("param")), 
+                           method = "spearman", use = "pairwise.complete.obs"),2)
+
+melted_corr_mat_wine <- melt(corr_mat_wine)
+
+pheatmap(corr_mat_wine, 
+         display_numbers = TRUE,  # Display correlation values inside cells
+         color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+         main = "Spearman Correlation Heatmap for Evaluation Metrics")
+
+```
+
+## Display top indices correlated to NMI
+
+```{r nmi_corr_wine, warning=FALSE, cache=TRUE}
+melted_corr_mat_wine %>% 
+  filter(Var1 == "NMI" & !Var2 %in% c("NMI","ARI")) %>% 
+  slice_max(value, n=5)
+```
+
+
+## Compare cluster metrics to the true number of classes (k = 3)
+
+```{r wine_k_3, warning=FALSE, cache=TRUE}
+eval_res_wine_k_3 <- eval_res_wine %>% 
+  dplyr::filter(param.k == 3) %>%
+  dplyr::select(!starts_with("param"))
+
+reactable(eval_res_wine_k_3,
+          columns = list(cohesiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         distinctiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         avg_silwidth = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         max_diameter = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         min_separation = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         pearson_gamma = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn2_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         entropy = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         wb_ratio = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ch_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         widest_gap = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         sep_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         index_C = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G2 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G3 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_S = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         NMI = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ARI = colDef(format = colFormat(locales = "en-US", digits = 4))))
+
+```
+
+# Running on Derma dataset
+
+```{r derma_dataset, warning=FALSE, cache=TRUE}
+data("derma")
+dim(derma)
+levels(as.factor(derma$ES))
+head(derma)
+```
+
+Convert all Clinical and Histopathological variables to factors:
+
+```{r derma_preprocess, warning=FALSE, cache=TRUE}
+derma.data <- derma %>% mutate(across(!ES, as.numeric)) %>% mutate_at(c("ES"), as.factor)
+str(derma.data)
+```
+
+
+## Display the evaluation metrics
+
+```{r run_all_derma, warning=FALSE, cache=TRUE}
+run_output_derma <- run_all(data=derma.data[1:34], labels=derma.data$ES)
+eval_res_derma <-  dplyr::select(run_output_derma, !starts_with("sample"))
+reactable(eval_res_derma,
+          columns = list(cohesiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         distinctiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         avg_silwidth = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         max_diameter = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         min_separation = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         pearson_gamma = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn2_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         entropy = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         wb_ratio = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ch_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         widest_gap = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         sep_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         index_C = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G2 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G3 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_S = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         NMI = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ARI = colDef(format = colFormat(locales = "en-US", digits = 4))))
+
+```
+
+## Create a spearman's rank correlation pairwise heatmap to compare all the evaluation metrics
+
+```{r heatmap_derma, warning=FALSE, cache=TRUE}
+# corr_mat_derma <- round(cor(eval_res_derma[,7:ncol(eval_res_derma)], method = "spearman", use = "pairwise.complete.obs"),2)
+corr_mat_derma <- round(cor(dplyr::select(eval_res_derma, !starts_with("param")), 
+                            method = "spearman", use = "pairwise.complete.obs"),2)
+
+melted_corr_mat_derma <- melt(corr_mat_derma)
+
+pheatmap(corr_mat_derma, 
+         display_numbers = TRUE,  # Display correlation values inside cells
+         color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+         main = "Spearman Correlation Heatmap for Evaluation Metrics")
+
+```
+
+## Display top indices correlated to NMI
+
+```{r nmi_corr_derma, warning=FALSE, cache=TRUE}
+melted_corr_mat_derma %>% 
+  filter(Var1 == "NMI" & !Var2 %in% c("NMI","ARI")) %>% 
+  slice_max(value, n=5)
+```
+
+
+## Compare cluster metrics to the true number of classes (k = 6)
+
+```{r derma_k_6, warning=FALSE, cache=TRUE}
+eval_res_derma_k_6 <- eval_res_derma %>% 
+  dplyr::filter(param.k == 6) %>%
+  dplyr::select(!starts_with("param"))
+
+reactable(eval_res_derma_k_6,
+          list(cohesiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         distinctiveness = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         avg_silwidth = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         max_diameter = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         min_separation = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         pearson_gamma = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         dunn2_index = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         entropy = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         wb_ratio = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ch_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         widest_gap = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         sep_index = colDef(format = colFormat(locales = "en-US", digits = 2)),
+                         index_C = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G2 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_G3 = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         index_S = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         NMI = colDef(format = colFormat(locales = "en-US", digits = 4)),
+                         ARI = colDef(format = colFormat(locales = "en-US", digits = 4))))
+```
+
+

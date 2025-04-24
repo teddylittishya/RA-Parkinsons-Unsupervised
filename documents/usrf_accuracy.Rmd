@@ -1,0 +1,302 @@
+---
+title: "Cluster tendency using unsupervised random forest 2"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(yfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(randomForest)
+library(parallel)
+library(MASS)
+```
+
+# Introduction
+
+An alternative to using the Hopkins statistic is to use metrics innate to the random forest
+algorithm to estimate clustering tendency. Similar to the Hopkins statistic, we generate the null
+distribution of random data and compare our new statistic to that null distribution. The three
+things I want to test here are the following: 
+
+1. The prediction accuracy of unsupervised random forest
+2. The mean decrease accuracy of the features used in unsupervised random forest (distribution vs
+   maximum)
+3. The decrease in (Gini) node impurity of the features (distribution vs maximum)
+
+# Running unsupervised random forest
+
+The two main parameters I expect to affect accuracy, mean decrease accuracy, and Gini impurity are
+the number of features and the number of samples.
+
+```{r sample_data_set_func}
+sample_data_set = function(x, m=nrow(x)) {
+    n = nrow(x)
+    x = x %>% mutate(across(everything(), 
+        function(.x) {
+            if(all(.x == 0 | .x == 1)) { # binary
+                return(sample(c(0, 1), size=n, replace=T))
+            } else if(is.numeric(.x)) { # continuous
+                return(runif(n, min=min(.x), max=max(.x)))
+            } else if(is.factor(.x)) { # categorical
+                return(factor(sample(unique(.x), size=n, replace=T)))
+            } else { # other?
+                return(sample(.x, size=n, replace=T))
+            }
+        })) %>%
+        slice_sample(n=m)
+    x
+}
+```
+```{r random_data_set_func}
+
+#' @param m number of rows
+#' @param d number of columns
+#' @param type one of `cont` or `cat` for continuous or categorical random data
+#' @param num.cat number of categories for categorical random data; if length of num.cat is equal
+#'        to d, then the number of categories for column i be num.cat[i] 
+random_data_set = function(m, d, type=c('cont', 'cat'), num.cat=3) {
+    type = match.arg(type)
+    tmp = NULL
+    if(type == 'cont') {
+        tmp = do.call('data.frame', 
+                      lapply(1:d, function(.x) runif(n=m)))
+        colnames(tmp) = paste0('rand_cont_runif_', 1:d)
+    } else if(type == 'cat') {
+        if(length(num.cat) == d) {
+            num.cat = num.cat
+        } else {
+            num.cat = rep(num.cat, d)
+        }
+        tmp = do.call('data.frame', 
+                      lapply(num.cat, function(.x) factor(sample(1:.x, size=m, replace=T))))
+        colnames(tmp) = paste0('rand_cat', num.cat, '_', 1:d)
+    }
+    return(tmp)
+}
+```
+```{r usrf_test_func, class.source='fold-show'}
+usrf = function(x, seed=42, ntree=1000) {
+    set.seed(seed)
+    x_fake = x %>% mutate(across(everything(), ~ sample(.x, size=nrow(x))))
+    rf = randomForest(x=rbind(x, x_fake),
+                      y=factor(c(rep('real', nrow(x)), rep('fake', nrow(x_fake)))),
+                      importance=T,
+                      keep.forest=F,
+                      ntree=ntree
+                      )
+    rf
+}
+```
+
+# Stability of accuracy over trees
+
+```{r usrf_stability}
+stability = cache_rds({
+    mclapply(4:20, function(d) {
+        stderrp('Starting run with d = ', d)
+        ds = random_data_set(m=50, d=d, type='cont')
+        usrf(ds, seed=42, ntree=50000)        
+    }, mc.cores=3)
+}, rerun=F, clean=T)
+```
+```{r usrf_stability_plot}
+tmp = bind_rows(lapply(seq_along(stability), function(i) {
+    rf = stability[[i]]
+    sample_points = c(1, seq(from=1000, to=50000, by=1000))
+    data.frame(ntree=sample_points,
+               d=(4:20)[i],
+               err=rf$err.rate[sample_points, 'OOB'],
+               real.err=rf$err.rate[sample_points, 'real'],
+               fake.err=rf$err.rate[sample_points, 'fake']
+    )
+}))
+mycolors <- colorRampPalette(RColorBrewer::brewer.pal(8, "RdYlGn"))(length(stability))
+ggplot(tmp) +
+    geom_line(aes(x=ntree, y=err, color=factor(d))) +
+    scale_color_manual('Number of dimensions', values=mycolors) +
+    ylab("Out-of-bag error") +
+    theme_minimal()
+```
+```{r usrf_stability_plot2}
+tmp = bind_rows(lapply(seq_along(stability), function(i) {
+    rf = stability[[i]]
+    sample_points = c(1, seq(from=100, to=2000, by=100))
+    data.frame(ntree=sample_points,
+               d=(4:20)[i],
+               err=rf$err.rate[sample_points, 'OOB'],
+               real.err=rf$err.rate[sample_points, 'real'],
+               fake.err=rf$err.rate[sample_points, 'fake']
+    )
+}))
+mycolors <- colorRampPalette(RColorBrewer::brewer.pal(8, "RdYlGn"))(length(stability))
+ggplot(tmp) +
+    geom_line(aes(x=ntree, y=err, color=factor(d))) +
+    scale_color_manual('Number of dimensions', values=mycolors) +
+    ylab("Out-of-bag error") +
+    theme_minimal()
+```
+
+# Simulated Multivariate-normal data
+
+## Test 1 - means 0 and 1
+
+Here, I simulate a data set using a multivariate normal distribution over 100 dimensions with 0
+covariance. One class has variable means of 0, and the other class has variable means of 1. We use
+a sample size of 50 for each class.
+
+```{r simulate_2_class_1}
+set.seed(42)
+d = 100
+tmp = mvrnorm(n=50, mu=rep(0, d), Sigma=diag(rep(1, d)))
+tmp2 = mvrnorm(n=50, mu=rep(1, d), Sigma=diag(rep(1, d)))
+sim_2class = data.frame(rbind(tmp, tmp2))
+sim_2class.y = factor(c(rep('class1', 50), rep('class2', 50)))
+
+test_d = c(3, 5, 7, seq(from=10, to=100, by=10))
+
+sim_2class_res = cache_rds({
+    lapply(test_d, function(d) {
+        x = sim_2class[,1:d]    
+        usrf(x, ntree=1000)
+    })
+}, rerun=F, clean=T)
+
+tmp = data.frame(d=test_d,
+           err=sapply(sim_2class_res, function(x) x$err.rate[x$ntree,1])
+)
+p1 = ggplot(tmp) +
+    geom_point(aes(x=d, y=err)) +
+    xlab("Number of dimensions") +
+    ylab("OOB error") +
+    theme_minimal()
+```
+```{r plot_sim_2_class_1, fig.height=4, fig.width=7}
+tmp = data.frame(x=sim_2class[,1], y=sim_2class.y)
+p2 = ggplot(tmp) +
+    geom_density(aes(x=x, fill=y)) +
+    xlab("One dimension variable") +
+    ylab("Density") +
+    scale_fill_brewer(name="Class", palette="Set2") +
+    theme_minimal()
+p1 + p2
+```
+
+## Test 2 - means 0 and 3
+
+Here, I simulate a data set using a multivariate normal distribution over 100 dimensions with 0
+covariance. One class has variable means of 0, and the other class has variable means of 3. We use
+a sample size of 50 for each class.
+
+```{r simulate_2class_2}
+library(MASS)
+set.seed(42)
+d = 100
+tmp = mvrnorm(n=50, mu=rep(0, d), Sigma=diag(rep(1, d)))
+tmp2 = mvrnorm(n=50, mu=rep(3, d), Sigma=diag(rep(1, d)))
+sim_2class = data.frame(rbind(tmp, tmp2))
+sim_2class.y = factor(c(rep('class1', 50), rep('class2', 50)))
+
+test_d = c(3, 5, 7, seq(from=10, to=100, by=10))
+
+sim_2class_res = cache_rds({
+    lapply(test_d, function(d) {
+        x = sim_2class[,1:d]    
+        usrf(x, ntree=1000)
+    })
+}, rerun=F, clean=T)
+
+tmp = data.frame(d=test_d,
+           err=sapply(sim_2class_res, function(x) x$err.rate[x$ntree,1])
+)
+p1 = ggplot(tmp) +
+    geom_point(aes(x=d, y=err)) +
+    xlab("Number of dimensions") +
+    ylab("OOB error") +
+    theme_minimal()
+```
+```{r plot_sim_2class_2, fig.height=4, fig.width=7}
+tmp = data.frame(x=sim_2class[,1], y=sim_2class.y)
+p2 = ggplot(tmp) +
+    geom_density(aes(x=x, fill=y)) +
+    xlab("One dimension variable") +
+    ylab("Density") +
+    scale_fill_brewer(name="Class", palette="Set2") +
+    theme_minimal()
+p1 + p2
+```

@@ -1,0 +1,147 @@
+
+
+processing file: clustertend.Rmd
+1/61                                 
+2/61 [setup]                         
+3/61 [loadLibraries]                 
+
+ loadLibraries             1.58 secs
+4/61                                 
+5/61 [iris_hopkins_graph]            
+
+ iris_hopkins_graph        0.63 secs
+6/61                                 
+7/61 [Hopkins.rf]                    
+
+ Hopkins.rf                   0 secs
+8/61 [Hopkins.rf2]                   
+
+ Hopkins.rf2                  0 secs
+9/61                                 
+10/61 [hopkins_iris_comparison]       
+
+ hopkins_iris_comparison      0.02 secs
+11/61 [plot_hopkins_iris_comparison]  
+
+ plot_hopkins_iris_comparison      0.44 secs
+12/61                                 
+13/61 [beta_test1]                    
+
+ beta_test1                0.01 secs
+14/61 [plot_beta_test1]               
+
+ plot_beta_test1           0.28 secs
+15/61                                 
+16/61 [qqplot_funcs]                  
+
+ qqplot_funcs                 0 secs
+17/61 [betatest1_qqplot]              
+
+ betatest1_qqplot          1.08 secs
+18/61                                 
+19/61 [empirical_beta_params]         
+
+ empirical_beta_params      0.23 secs
+20/61                                 
+21/61 [beta_test2]                    
+
+ beta_test2                0.01 secs
+22/61 [plot_beta_test2]               
+
+ plot_beta_test2           0.17 secs
+23/61                                 
+24/61 [beta_test3]                    
+
+ beta_test3                0.01 secs
+25/61                                 
+26/61 [adj_hopstat]                   
+
+ adj_hopstat               0.13 secs
+27/61                                 
+28/61 [adj_hopstat_estimate_power]    
+
+ adj_hopstat_estimate_power      0.01 secs
+29/61 [adj_power_plot]                
+
+ adj_power_plot            0.32 secs
+30/61                                 
+31/61 [Hopkins.rf3]                   
+
+ Hopkins.rf3                  0 secs
+32/61                                 
+33/61 [beta_test4]                    
+
+ beta_test4                0.19 secs
+34/61                                 
+35/61 [betatest4_qqplot]              
+
+ betatest4_qqplot          0.65 secs
+36/61                                 
+37/61 [beta_test5]                    
+
+ beta_test5                   0 secs
+38/61 [beta_test5_qqplot]             
+
+ beta_test5_qqplot         0.63 secs
+39/61                                 
+40/61 [beta_test6]                    
+
+ beta_test6                0.08 secs
+41/61 [beta_test6_collectdata]        
+
+ beta_test6_collectdata      3.63 secs
+42/61                                 
+43/61 [logfits]                       
+
+ logfits                   2.55 secs
+44/61                                 
+45/61 [print_logfits]                 
+
+ print_logfits             0.13 secs
+46/61                                 
+47/61 [all_points_plot]               
+
+ all_points_plot           0.16 secs
+48/61                                 
+49/61 [lasso_full_param_sweep]        
+
+ lasso_full_param_sweep      0.06 secs
+50/61                                 
+51/61 [logm_logd_interaction_only]    
+
+ logm_logd_interaction_only      0.01 secs
+52/61                                 
+53/61 [adjusted_logm_logd_interaction]
+
+ adjusted_logm_logd_interaction      0.35 secs
+54/61                                 
+55/61 [hoprf4]                        
+
+ hoprf4                       0 secs
+56/61                                 
+57/61 [hoprf5]                        
+
+ hoprf5                       0 secs
+58/61                                 
+59/61 [iris_test_hoprf4]              
+
+ iris_test_hoprf4          0.14 secs
+60/61                                 
+61/61 [iris_test_with_noise]          
+[1] 20
+[1] 40
+[1] 60
+[1] 80
+[1] 100
+[1] 120
+[1] 140
+[1] 160
+[1] 180
+[1] 200
+
+ iris_test_with_noise     45.27 secs
+output file: clustertend.knit.md
+
+/Users/yi/anaconda3/bin/pandoc +RTS -K512m -RTS clustertend.knit.md --to html4 --from markdown+autolink_bare_uris+tex_math_single_backslash --output clustertend.html --lua-filter /Users/yi/anaconda3/lib/R/library/rmarkdown/rmarkdown/lua/pagebreak.lua --lua-filter /Users/yi/anaconda3/lib/R/library/rmarkdown/rmarkdown/lua/latex-div.lua --embed-resources --standalone --variable bs3=TRUE --section-divs --table-of-contents --toc-depth 3 --variable toc_float=1 --variable toc_selectors=h1,h2,h3 --variable toc_collapsed=1 --variable toc_smooth_scroll=1 --variable toc_print=1 --template /Users/yi/anaconda3/lib/R/library/rmarkdown/rmd/h/default.html --highlight-style tango --number-sections --variable theme=paper --mathjax --variable 'mathjax-url=https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML' --include-in-header /var/folders/dj/88dqszwj5qj72y402s3bxw5c0000gn/T//RtmpPkMBH7/rmarkdown-str7b1788d06f6.html --variable code_folding=hide --variable source_embed=clustertend.Rmd --include-after-body /var/folders/dj/88dqszwj5qj72y402s3bxw5c0000gn/T//RtmpPkMBH7/file7b1762c404dc.html --variable code_menu=1 
+
+Output created: clustertend.html

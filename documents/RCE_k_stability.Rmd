@@ -1,0 +1,240 @@
+---
+title: "Comparing variable importance orderings across k values"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(yfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(parallel)
+source('../R/RCE_algorithm.R')
+```
+
+# Introduction
+
+[Link to RCE paper](https://link.springer.com/article/10.1007/s10994-013-5337-8)
+
+This document investigates how different $k$ values changes the variable importance orderings
+produced by RCE. This is quite important as we likely do not know the expected number of clusters
+*a priori*.
+
+# Parkinsons data set
+
+True $k = 2$
+
+```{r parkinsons_ktest}
+data <- read.table("../example_data/Bases/parkinson.txt", header=F, sep = "\t")
+k = ncol(data)
+V <- data[, k] # True clustering
+true_nclusters <- max(V) # Number of clusters
+data <- data[, 1:(k - 1)]
+
+parkinson_ktest = cache_rds({
+    lapply(2:10, function(k) {
+        mclapply(1:200, function(j) run_RCE(data, nclusters=k, nbiter=200, vfun=ic)$imp, mc.cores=4)
+    })
+}, rerun=F, clean=T)
+names(parkinson_ktest) = paste('k =', 2:10)
+```
+
+```{r pairwise_cor_parkinsons}
+tmp = sapply(parkinson_ktest, function(x) {
+    apply(do.call('cbind', x), 1, mean)
+})
+tmp = cor(tmp, method = 'spearman')
+tmp[lower.tri(tmp, diag=T)] = NA
+tmp2 = data.frame(tmp, check.names=F) %>%
+    tibble::rownames_to_column('k') %>%
+    pivot_longer(!k) %>%
+    filter(!is.na(value)) %>%
+    mutate(name = factor(name, levels = names(parkinson_ktest))) %>%
+    mutate(k = factor(k, levels = names(parkinson_ktest)))
+p1 = ggplot(tmp2) +
+    geom_tile(aes(x = k, y = name, fill = value)) +
+    scale_fill_gradient(name="", low="white", high='steelblue', limits=c(0, 1)) +
+    xlab("") +
+    ylab("") +
+    ggtitle("Spearman Correlation") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, vjust=1, hjust=1))
+min_park_spear = min(tmp2$value)
+```
+```{r pairwise_cor_parkinsons2, fig.height=4, fig.width=8}
+tmp = sapply(parkinson_ktest, function(x) {
+    apply(do.call('cbind', x), 1, mean)
+})
+tmp = cor(tmp, method = 'pearson')
+tmp[lower.tri(tmp, diag=T)] = NA
+tmp2 = data.frame(tmp, check.names=F) %>%
+    tibble::rownames_to_column('k') %>%
+    pivot_longer(!k) %>%
+    filter(!is.na(value)) %>%
+    mutate(name = factor(name, levels = names(parkinson_ktest))) %>%
+    mutate(k = factor(k, levels = names(parkinson_ktest)))
+p2 = ggplot(tmp2) +
+    geom_tile(aes(x = k, y = name, fill = value)) +
+    scale_fill_gradient(name="", low="white", high='green4', limits=c(0, 1)) +
+    xlab("") +
+    ylab("") +
+    ggtitle("Pearson Correlation") +
+    theme_minimal() + 
+    theme(axis.text.x = element_text(angle=60, vjust=1, hjust=1))
+p1 + p2
+min_park = min(tmp2$value)
+```
+
+
+# Breast Tissue
+
+True $k = 6$; however, one source claims that 3 classes are not distinguishable using this data
+set. i.e., $k = 4$
+
+```{r bt_ktest}
+data <- read.table("../example_data/Bases/Breast_Tissu.txt", header=F, sep = "\t")
+k = ncol(data)
+V <- data[, k] # True clustering
+true_nclusters <- max(V) # Number of clusters
+data <- data[, 1:(k - 1)]
+
+parkinson_ktest = cache_rds({
+    lapply(2:10, function(k) {
+        mclapply(1:200, function(j) run_RCE(data, nclusters=k, nbiter=200, vfun=ic)$imp, mc.cores=4)
+    })
+}, rerun=F, clean=T)
+names(parkinson_ktest) = paste('k =', 2:10)
+```
+
+```{r pairwise_cor_bt}
+tmp = sapply(parkinson_ktest, function(x) {
+    apply(do.call('cbind', x), 1, mean)
+})
+tmp = cor(tmp, method = 'spearman')
+tmp[lower.tri(tmp, diag=T)] = NA
+tmp2 = data.frame(tmp, check.names=F) %>%
+    tibble::rownames_to_column('k') %>%
+    pivot_longer(!k) %>%
+    filter(!is.na(value)) %>%
+    mutate(name = factor(name, levels = names(parkinson_ktest))) %>%
+    mutate(k = factor(k, levels = names(parkinson_ktest)))
+p1 = ggplot(tmp2) +
+    geom_tile(aes(x = k, y = name, fill = value)) +
+    scale_fill_gradient(name="", low="white", high='steelblue', limits=c(0, 1)) +
+    xlab("") +
+    ylab("") +
+    ggtitle("Spearman Correlation") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle=60, vjust=1, hjust=1))
+min_bt_spear = min(tmp2$value)
+```
+```{r pairwise_cor_bt2, fig.height=4, fig.width=8}
+tmp = sapply(parkinson_ktest, function(x) {
+    apply(do.call('cbind', x), 1, mean)
+})
+tmp = cor(tmp, method = 'pearson')
+tmp[lower.tri(tmp, diag=T)] = NA
+tmp2 = data.frame(tmp, check.names=F) %>%
+    tibble::rownames_to_column('k') %>%
+    pivot_longer(!k) %>%
+    filter(!is.na(value)) %>%
+    mutate(name = factor(name, levels = names(parkinson_ktest))) %>%
+    mutate(k = factor(k, levels = names(parkinson_ktest)))
+p2 = ggplot(tmp2) +
+    geom_tile(aes(x = k, y = name, fill = value)) +
+    scale_fill_gradient(name="", low="white", high='green4', limits=c(0, 1)) +
+    xlab("") +
+    ylab("") +
+    ggtitle("Pearson Correlation") +
+    theme_minimal() + 
+    theme(axis.text.x = element_text(angle=60, vjust=1, hjust=1))
+p1 + p2
+min_bt = min(tmp2$value)
+```
+
+# Conclusions
+
+- Generally, a range of $k$ values around the true number of clusters ($k=2$ for Parkinsons; $k=6$
+  for Breast Tissue) result in similar variable importance rankings.
+- Minimum Spearman correlation is `r min_park_spear` for Parkinsons and `r min_bt_spear` for Breast
+  Tissue.
+- Minimum Pearson correlation is `r min_park` for Parkinsons and `r min_bt` for Breast Tissue.
+- The rank order of variable importance appears to be quite stable across different $k$ values,
+  which means that a forward/recursive search would likely be robust to the choice of $k$.
+- However, the lower Pearson correlation may indicate that using the scree test as a hard cutoff
+  for variables would potentially yield different sets across $k$ values.
+

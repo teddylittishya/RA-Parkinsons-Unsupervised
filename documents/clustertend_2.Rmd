@@ -1,0 +1,274 @@
+---
+title: "Cluster tendency using unsupervised random forest"
+author: "Yi Chen"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(glmnet)
+```
+
+# Introduction
+
+Previously, we showed that the data followed a Beta distribution when the power of the Hopkins
+statistic was reduced to $1.5\log{d}\log{m}$. There seemd to be some bias in this empirical result
+based on visual examination. Here, I examine it further.
+
+```{r loadData}
+raw_dat = readRDS("cache/beta_test6_d253efd2a1fdfc81099175ecf66990e3.rds")
+```
+
+# Varying the power
+
+```{r test_power_func}
+dvals = c(5, 10, 20, 50, 100, 200)
+mvals = c(5, 10, 20, 50, 100, 200)
+p = ((1:200)/200 - 1/400)
+
+comp_dists = function(x, x_target) {
+    sum(abs(x - x_target))
+}
+hopcalc = function(obj, d=1) {
+    y_i = obj$y_i^d
+    x_i = obj$x_i^d
+    sum(y_i) / (sum(x_i) + sum(y_i))
+}
+test_power = function(i, j, dat, print.out=T) {
+    d = dvals[i]
+    m = mvals[j]
+    test_powers = log(d)*log(m)*seq(1, 2, length.out=100)
+    target_dist = qbeta(p, shape1=m, shape2=m)
+    tmp = sapply(test_powers, function(dt) {
+        tmp = sapply(1:200, function(s) hopcalc(dat[[i]][[j]][[s]], dt))
+        comp_dists(sort(tmp), target_dist)
+    })
+    if(print.out) {
+        return(rbind(sum_diff=tmp, power=test_powers, true_d=d))
+    }
+    data.frame(d=d, m=m, best_power=test_powers[which.min(tmp)])
+}
+```
+```{r vary_power, summary=T}
+tmp = cache_rds({
+    bind_rows(lapply(1:6, function(i) 
+                     bind_rows(lapply(1:6, function(j) test_power(i, j, raw_dat, print.out=F)))))
+}, rerun=F, clean=T)
+tmp
+vary_power = tmp
+```
+
+```{r cbrt_func}
+cbrt = function(x) x^(1/3)
+```
+```{r vary_power_plot5}
+tmp2 = bind_rows(
+tmp %>% filter(m == 5) %>% mutate(group="m=5", varied=cbrt(d)),
+tmp %>% filter(d == 5) %>% mutate(group="d=5", varied=cbrt(m))
+)
+vp5 = ggplot(tmp2) +
+    aes(x=varied, y=best_power, color=group, group=group) +
+    geom_line() +
+    geom_point() +
+    xlab("cube root(m or d)") +
+    scale_color_brewer("", palette="Dark2") +
+    geom_line(stat="smooth", method="lm", formula = y ~ x, se = F, linetype="dashed", alpha=0.5) +
+    theme_minimal()
+```
+```{r vary_power_plot10}
+tmp2 = bind_rows(
+tmp %>% filter(m == 10) %>% mutate(group="m=10", varied=cbrt(d)),
+tmp %>% filter(d == 10) %>% mutate(group="d=10", varied=cbrt(m))
+)
+vp10 = ggplot(tmp2) +
+    aes(x=varied, y=best_power, color=group, group=group) +
+    geom_line() +
+    geom_point() +
+    xlab("cube root(m or d)") +
+    scale_color_brewer("", palette="Dark2") +
+    geom_line(stat="smooth", method="lm", formula = y ~ x, se = F, linetype="dashed", alpha=0.5) +
+    theme_minimal()
+```
+```{r vary_power_plot20}
+tmp2 = bind_rows(
+tmp %>% filter(m == 20) %>% mutate(group="m=20", varied=cbrt(d)),
+tmp %>% filter(d == 20) %>% mutate(group="d=20", varied=cbrt(m))
+)
+vp20 = ggplot(tmp2) +
+    aes(x=varied, y=best_power, color=group, group=group) +
+    geom_line() +
+    geom_point() +
+    xlab("cube root(m or d)") +
+    scale_color_brewer("", palette="Dark2") +
+    geom_line(stat="smooth", method="lm", formula = y ~ x, se = F, linetype="dashed", alpha=0.5) +
+    theme_minimal()
+```
+```{r vary_power_plot50}
+tmp2 = bind_rows(
+tmp %>% filter(m == 50) %>% mutate(group="m=50", varied=cbrt(d)),
+tmp %>% filter(d == 50) %>% mutate(group="d=50", varied=cbrt(m))
+)
+vp50 = ggplot(tmp2) +
+    aes(x=varied, y=best_power, color=group, group=group) +
+    geom_line() +
+    geom_point() +
+    xlab("cube root(m or d)") +
+    scale_color_brewer("", palette="Dark2") +
+    geom_line(stat="smooth", method="lm", formula = y ~ x, se = F, linetype="dashed", alpha=0.5) +
+    theme_minimal()
+```
+```{r vary_power_plot100}
+tmp2 = bind_rows(
+tmp %>% filter(m == 100) %>% mutate(group="m=100", varied=cbrt(d)),
+tmp %>% filter(d == 100) %>% mutate(group="d=100", varied=cbrt(m))
+)
+vp100 = ggplot(tmp2) +
+    aes(x=varied, y=best_power, color=group, group=group) +
+    geom_line() +
+    geom_point() +
+    xlab("cube root(m or d)") +
+    scale_color_brewer("", palette="Dark2") +
+    geom_line(stat="smooth", method="lm", formula = y ~ x, se = F, linetype="dashed", alpha=0.5) +
+    theme_minimal()
+```
+```{r show_vary_plots, fig.height=7}
+vp5 + vp10 + vp20 + vp50 + vp100 + plot_layout(ncol=2)
+```
+
+<mark>Observations:</mark>
+
+- When $d$ is constant, the growth w/r/t $m$ is faster than when $m$ is constant.
+- It seems that the best power appears to be a function of $m^{\frac{1}{3}}$, where the slope may
+  be a function of $d$.
+
+## Finding the slope when m is constant
+
+```{r dconstant_slope}
+dconstant = bind_rows(lapply(dvals, function(dval) {
+    tmp = tmp %>% filter(d == dval) %>% mutate(cbrt_m = cbrt(m))
+    mod = lm(best_power ~ cbrt_m, data=tmp)
+    mod2 = lm(best_power ~ cbrt_m + 0, data=tmp)
+    data.frame(d=dval, slope=coef(mod)[2], intercept=coef(mod)[1], slope_0=coef(mod2)[1], 
+               r2=summary(mod)$r.squared, r2_0=summary(mod2)$r.squared)
+}))
+rownames(dconstant) = dvals
+dconstant
+```
+```{r d_slope_plot}
+tmp = dconstant %>%
+    mutate(log_d=log(d), sqrt_d=sqrt(d), cbrt_d=cbrt(d), 
+           mtry=floor(sqrt(d)), log_mtry=log(floor(sqrt(d))))
+d_transforms = c("d", "log_d", 'sqrt_d', 'cbrt_d', 'mtry', 'log_mtry')
+plots = lapply(d_transforms, function(x) {
+    ggplot(tmp) +
+        aes(x=.data[[x]], y=slope_0) +
+        geom_point() +
+        xlab(x) +
+        geom_line(stat="smooth", method="lm", formula=y ~ x, se=F, linetype="dashed", alpha=0.5) +
+        theme_minimal()
+})
+wrap_plots(plots, ncol=2)
+```
+```{r log_d_slope_linear_model, summary=T}
+mod = lm(slope_0 ~ log_d, data=tmp)
+summary(mod)
+```
+```{r log_mtry_slope_linear_model, summary=T}
+mod = lm(slope_0 ~ log_mtry, data=tmp)
+summary(mod)
+```
+
+```{r}
+vary_power = vary_power %>%
+    mutate(mtry=floor(sqrt(d)), log_mtry=log(mtry), pred=(3.642*log_mtry-1)*cbrt(m))
+p1 = ggplot(vary_power) +
+    aes(x=best_power, y=pred, color=factor(m)) +
+    scale_color_brewer("m", palette="Dark2") +
+    geom_point() +
+    geom_line() +
+    geom_abline(slope=1, intercept=0, linetype="dashed", alpha=0.5) +
+    theme_minimal()
+p2 = ggplot(vary_power) +
+    aes(x=best_power, y=pred, color=factor(d)) +
+    scale_color_brewer("d", palette="Set2") +
+    geom_point() +
+    geom_line() +
+    geom_abline(slope=1, intercept=0, linetype="dashed", alpha=0.5) +
+    theme_minimal()
+p1 + p2
+```

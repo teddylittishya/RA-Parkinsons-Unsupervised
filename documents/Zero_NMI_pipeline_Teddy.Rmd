@@ -1,0 +1,543 @@
+---
+title: "Zero_NMI_Pipeline_Teddy"
+author: "Teddy Thomas"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: paper
+        highlight: tango
+        toc: true
+        toc_depth: 3
+        toc_float:
+            collapsed: true
+        number_sections: true
+        code_download: true
+        df_print: kable
+        code_folding: hide
+        mode: selfcontained
+---
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({
+  TeX: { equationNumbers: { autoNumber: "AMS" } }
+});
+</script>
+<style type="text/css">
+body{ font-family: serif; font-size: 11pt; }
+h1 { font-size: 24pt; }
+h2 { font-size: 20pt; }
+h3 { font-size: 16pt; }
+summary { cursor: pointer; }
+p { max-width: 600px; }
+caption, .caption { color: #666666; }
+details {padding-top:15px; padding-bottom:15px;}
+embed { width: 750px; height: 600px; }
+.toc-content{ max-width: 750px; }
+</style>
+
+```{r setup, echo=F, warning=F, setup=T}
+knitr::opts_knit$set(upload.fun = knitr::image_uri)
+knitr::opts_chunk$set(fig.align="center", results="hold", cache.path="cache/", dev="png",
+                      fig.width=6.5, fig.height=6.5)
+R.utils::setOption("digits", 4)
+stderrp = function(...) { 
+    dots = list(...)
+    if(any(sapply(dots, class) == 'character')) {
+        write(paste(...), stderr()) 
+    } else {
+        write(paste0(capture.output(...)), stderr()) 
+    }
+}
+ic = stderrp
+knitr::knit_hooks$set(timeit = local({
+    now <- NULL
+    function(before, options) {
+        if(before) {
+            now <<- Sys.time()
+        } else {
+            res <- difftime(Sys.time(), now)
+            now <- NULL
+            stderrp(paste('\n',
+                stringr::str_pad(options$label, 20, side="right"), 
+                stringr::str_pad(round(as.numeric(res), digits=2), 9),
+                units(res)))
+        }
+    }}),
+    summary = {
+        function(before, options) {
+            if(before) {
+                return(asis_output(paste0("<details><summary>", 
+                                         gsub('_', ' ', options$label), "</summary>\n")))
+            } else {
+                return(asis_output("</details>\n"))
+            }
+        }
+    }
+)
+knitr::opts_chunk$set(timeit=T)
+is.html = knitr::is_html_output()
+```
+
+
+
+```{r loadLibraries, echo=F, message=F, warning=F, loadLibraries=T}
+library(xfun)
+library(knitr)
+library(reactable)
+library(tidyverse)
+library(patchwork)
+library(randomForest)
+library(reshape2)
+library(ggplot2)
+library(pheatmap)
+library(aricode)
+library(mclust)
+```
+
+# Code
+
+```{r clustering_module, class.source='fold-show', summary=T}
+
+
+#' Clustering module
+#'
+#' Takes as input a distance matrix and runs clustering algorithms with a given set of parameters.
+#'
+#' @param x distance matrix object of type `dist` with dimensions n x n
+#' @param algo clustering algorithm
+#' @param k_method method for determining the number of clusters (ignored for OPTICS)
+#' @param ... additional arguments depending on the choice of `algo`
+#'  - For 'OPTICS': 
+#'     \itemize{
+#'       \item \code{minPts}: Minimum number of points in a neighborhood for a point to be considered a core point.
+#'       \item \code{xi}: Minimum reachability distance for clustering.
+#'     }
+#'   - For 'kmeans': 
+#'     \itemize{
+#'       \item \code{k}: Number of clusters or initial cluster centers.
+#'     }
+#'   - For 'hierarchical': 
+#'     \itemize{
+#'       \item \code{agg_method}: Linkage method ('complete', 'single', 'average', etc.) for hierarchical clustering.
+#'       \item \code{k}: Number of clusters to be formed by cutting the dendrogram.
+#'     }
+#' @return vector of length n with cluster memberships
+#' @import dbscan
+#' @import cluster
+#' @export
+#' 
+cluster_module <- function(x, 
+                           algo=c('OPTICS', 'kmeans', 'pam', 'fanny', 'hierarchical', 'agnes', 'diana','spectral', 'affinity', 'GMM'),
+                           ...) {
+  algo = match.arg(algo)
+  params <- list(...)
+  cvec <- vector()
+  switch(algo,
+         'OPTICS' = {
+           # Ordering Points to Identify the Clustering Structure (OPTICS)
+           reach <- dbscan::optics(x, minPts = params$minPts)
+           clusters <- dbscan::extractXi(reach, xi= params$xi, minimum=T)
+           cvec <- clusters$cluster
+           print(length(cvec))
+         },
+         'kmeans' = {
+           # K-Means Clustering (Partitioning Clustering)
+           clusters <- stats::kmeans(x, centers = params$k)
+           cvec <- clusters$cluster
+         },
+         'pam' = {
+           # Partitioning Around Medoids (Partitioning Clustering)
+           clusters <- cluster::pam(x, k = params$k)
+           cvec <- clusters$clustering
+         },
+         'fanny' = {
+           # Fuzzy Analysis Clustering (Partitioning Clustering)
+           clusters <- cluster::fanny(x, k = params$k, maxit=1000)
+           cvec <- clusters$clustering
+         },
+         'hierarchical' = {
+           # Hierarchical Clustering
+           switch(params$agg_method,
+                  'average' = {
+                    clusters <- stats::hclust(x, method = "average")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'single' = {
+                    clusters <- stats::hclust(x, method = "single")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'complete' = {
+                    clusters <- stats::hclust(x, method = "complete")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'ward' = {
+                    clusters <- stats::hclust(x, method = "ward.D")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'mcquitty' = {
+                    clusters <- stats::hclust(x, method = "mcquitty")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  })
+         },
+         'agnes' = {
+           # Agglomerative Nesting (Hierarchical Clustering)
+           switch(params$agg_method,
+                  'average' = {
+                    clusters <- cluster::agnes(x, method = "average")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'single' = {
+                    clusters <- cluster::agnes(x, method = "single")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'complete' = {
+                    clusters <- cluster::agnes(x, method = "complete")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'ward' = {
+                    clusters <- cluster::agnes(x, method = "ward")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'mcquitty' = {
+                    clusters <- cluster::agnes(x, method = "weighted")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  })
+         },
+         'diana' = {
+           # Divisive Analysis Clustering (Hierarchical Clustering)
+           clusters <- cluster::diana(x)
+           cvec <- stats::cutree(clusters, k = params$k)
+         },
+         'spectral' = {
+           # Spectral Clustering
+           clusters <- kernlab::specc(as.matrix(x), centers = params$k)
+           cvec <- as.numeric(clusters)
+         },
+         'affinity' = {
+           # Affinity Propagation
+           clusters <- apcluster::apcluster(negDistMat(r=2), as.matrix(x))
+           cvec <- clusters@idx
+         },
+         'GMM' = {
+           # Gaussian Mixture Model Clustering (Mclust)
+           clusters <- mclust::Mclust(as.matrix(x), G = params$G)
+           cvec <- clusters$classification
+         },
+         
+         {
+           stop("The argument k_method is required. ", "Possible values are OPTICS, kmeans, pam, fanny, hierarchical, agnes, diana", "spectral", "affinity", "GMM")
+         })
+  
+  return(cvec)
+}
+
+```
+
+# Print the output of the cluster module by printing the dimension
+```{r}
+data("iris")
+iris <- iris[ ,-5] #exclude the species column for clustering
+rf_model  <- randomForest(iris, ntree = 500, proximity = TRUE)
+dist_mat <- as.dist(1- rf_model$proximity)
+
+#Test optics
+cluster_result <- cluster_module(dist_mat, algo = "OPTICS", minPts = 5, xi = 0.05)
+print(cluster_result)
+```
+
+```{r evaluation_module, class.source='fold-show', summary=T}
+#' Evaluation module
+#'
+#' Takes as input the cluster memberships produced by a single run of `cluster_module`, and the
+#' parameters used by `cluster_module`. Returns a list of evaluation metrics for that run of
+#' `cluster_module`.
+#'
+#' @param cvec numeric vector of length n with cluster memberships
+#' @param parameter list of parameters used by `cluster_module`
+#' @param supervised boolean indicating whether or not to use supervised learning as a metric of
+#'   cluster quality
+#' @return numeric vector of evaluation metrics including
+#'   - Cohesiveness: Measures how tightly grouped points are within clusters.
+#'   - Separation: Measures how distinct clusters are from each other.
+#'   - Cluster Sizes: Number of data points in each cluster.
+#'   - Other relevant clustering metrics depending on the implementation.
+#' @import fpc
+#' @import clusterSim
+#' @export
+#' 
+evaluation_module <- function(x,
+                              cvec, 
+                              parameter, 
+                              supervised=F) {
+  if(is.null(cvec) | all(cvec == 0)) { 
+      return(list(nbclust=NA,
+                  cohesiveness=NA,
+                  distinctiveness=NA,
+                  n_between=NA,
+                  n_within=NA,
+                  avg_silwidth=NA,
+                  max_diameter=NA,
+                  min_separation=NA,
+                  pearson_gamma=NA,
+                  dunn_index=NA,
+                  dunn2_index=NA,
+                  entropy=NA,
+                  wb_ratio=NA,
+                  ch_index=NA,
+                  widest_gap=NA,
+                  sep_index=NA,
+                  index_C=NA,
+                  index_G2=NA,
+                  index_G3=NA,
+                  index_S=NA
+      )) 
+  }
+  #Print cvec before removal of cvec
+  # if(algo == "OPTICS")
+  # print(paste("Length before removal",length(cvec)))
+  # which.zero = which(cvec == 0)
+  # cvec = cvec[!which.zero]
+  # x = x[!which.zero, !which.zero]
+  # cvec = as.numeric(factor(cvec)) # renumber cvec
+  # print(paste("Length after removal",length(cvec)))
+  # 
+  # calculate clustering statistics
+  stats <- fpc::cluster.stats(x, cvec)
+  
+  # prepare output with evaluation metrics
+  out = list(nbclust = stats$cluster.number,
+             cohesiveness = stats$average.within, 
+             # Measures how closely points are grouped within the same cluster.
+             distinctiveness = stats$average.between, 
+             # Measures how well clusters are separated from each other.
+             n_between = stats$n.between,
+             # Indicates the number of between-cluster distance measurements.
+             n_within = stats$n.within,
+             # Indicates the number of within-cluster distance measurements.
+             avg_silwidth = stats$avg.silwidth,
+             #  Provides the average silhouette width, which measures the quality of the clusters.
+             max_diameter = stats$max.diameter,
+             # Measures the greatest distance within two points in a cluster
+             min_separation = stats$min.separation,
+             # Measures the minimum separation between clusters.
+             # gamma_coef = stats$g2,
+             # Represents the gamma coefficient, used to evaluate clustering quality.
+             # g3_coeff = stats$g3,
+             # Represents the g3 coefficient, used to evaluate clustering quality.
+             pearson_gamma = stats$pearsongamma,
+             # Represents the pearson gamma coefficient which assess clustering quality. 
+             dunn_index = stats$dunn,
+             # Evaluates the ratio of minimum inter-cluster distance to maximum intra-cluster distance.
+             dunn2_index = stats$dunn2,
+             # Measures the modified Dunn index.
+             entropy = stats$entropy,
+             # Measures the entropy (distance and homogenity) of the clusters
+             wb_ratio = stats$wb.ratio,
+             # Represents the within-between cluster ratio, used for clustering evaluation.
+             ch_index = stats$ch,
+             # Provides the Calinski-Harabasz index, used to evaluate the dispersion of clusters.
+             widest_gap = stats$widestgap,
+             # Measures the widest gap between clusters.
+             sep_index = stats$sindex,
+             # Represents the separation index, used for clustering evaluation.
+             index_C = clusterSim::index.C(x, cvec),
+             # Calculates Hubert & Levin C index - internal cluster quality index
+             index_G2 = clusterSim::index.G2(x, cvec),
+             # Calculates G2 internal cluster quality index
+             index_G3 = clusterSim::index.G3(x, cvec),
+             # Calculates G3 internal cluster quality index
+             index_S = clusterSim::index.S(x, cvec)
+             # Calculates Rousseeuw’s Silhouette internal cluster quality index
+  )
+  
+  #assign class to output list
+  class(out) = 'evaluation_module'
+  return(out)
+}
+```
+
+
+# Removal of zero points
+
+```{r}
+data("iris")
+iris <- iris[ ,-5] # Exclude the species column for clustering
+rf_model <- randomForest(iris, ntree = 500, proximity = TRUE)
+dist_mat <- as.matrix(1 - rf_model$proximity) # Convert to a matrix for easier subsetting
+
+# Test OPTICS
+cluster_result <- cluster_module(dist_mat, algo = "OPTICS", minPts = 5, xi = 0.05)
+str(cluster_result)
+cvec <- cluster_result
+print(paste("length of cvec ",length(cvec)))
+
+# Remove zero-labeled points from both `cvec` and `dist_mat`
+zero_indices <- which(cvec == 0)         # Find indices where label is zero
+cvec_cleaned <- cvec[-zero_indices]       # Remove zero-labeled points from `cvec`
+dist_mat_cleaned <- dist_mat[-zero_indices, -zero_indices]  # Remove corresponding rows and columns
+print(paste("cvec_cleaned dimension",length(cvec_cleaned)))
+evaluation_result <-evaluation_module(x = dist_mat_cleaned, cvec = cvec_cleaned, parameter = NULL)
+
+# # Run the evaluation module on the cleaned data
+# evaluation_result <- tryCatch(
+#   evaluation_module(x = dist_mat_cleaned, cvec = cvec_cleaned, parameter = NULL),
+#   error = function(e) { cat("Error in evaluation_module:", e$message, "\n") }
+# )
+
+# Print lengths and evaluation results to verify
+print(length(cvec_cleaned))
+print(evaluation_result)
+
+```
+
+
+# Consider all the zero points as a seperate cluster
+```{r}
+data("iris")
+iris <- iris[ ,-5] # Exclude the species column for clustering
+rf_model <- randomForest(iris, ntree = 500, proximity = TRUE)
+dist_mat <- as.matrix(1 - rf_model$proximity) # Convert to a matrix for easier subsetting
+
+# Test OPTICS
+cluster_result <- cluster_module(dist_mat, algo = "OPTICS", minPts = 5, xi = 0.05)
+str(cluster_result)
+cvec <- cluster_result
+print(paste("Length of cvec:", length(cvec)))
+
+# Determine the next cluster number based on unique non-zero cluster labels
+max_cluster_label <- max(cvec)  # Find the highest cluster label in `cvec`
+new_cluster_label <- max_cluster_label + 1  # Set the next label for zero-labeled points
+
+# Reassign zero-labeled points to the next available cluster label
+cvec_reassigned <- ifelse(cvec == 0, new_cluster_label, cvec)
+
+# Run the evaluation module on the reassigned cluster labels
+evaluation_result <- tryCatch(
+  evaluation_module(x = dist_mat, cvec = cvec_reassigned, parameter = NULL),
+  error = function(e) { cat("Error in evaluation_module:", e$message, "\n") }
+)
+
+# Print lengths and evaluation results to verify
+print(paste("Length of cvec_reassigned:", length(cvec_reassigned)))
+print(evaluation_result)
+
+```
+
+## Check and analyze the newly assigned cluster 
+```{r}
+# Identify the new cluster label for zero-labeled points
+new_cluster_label <- max(cvec) + 1  # This should match the dynamically assigned label
+
+# Filter indices or data points in the new cluster
+new_cluster_indices <- which(cvec_reassigned == new_cluster_label)
+new_cluster_points <- iris[new_cluster_indices, ]  # Use original data if needed
+
+# Print out details of the points in the new cluster
+print(paste("Number of points in the new cluster (label", new_cluster_label, "):", length(new_cluster_indices)))
+print("Points in the new cluster:")
+print(new_cluster_points)
+
+# Summary statistics for analysis
+print("Summary statistics for points in the new cluster:")
+print(summary(new_cluster_points))
+
+# Optional: Visualize the points in the new cluster
+pairs(new_cluster_points, main = paste("Scatter plot matrix for new cluster (label", new_cluster_label, ")"))
+
+```
+
+# Randomly assign unclustered points to other clusters
+
+```{r}
+# Load required data
+data("iris")
+iris <- iris[,-5] # Exclude the species column for clustering
+
+# Create a random forest proximity-based distance matrix
+rf_model <- randomForest::randomForest(iris, ntree = 500, proximity = TRUE)
+dist_mat <- as.matrix(1 - rf_model$proximity) # Distance matrix for clustering
+
+# Run the OPTICS clustering algorithm to get initial clusters
+cluster_result <- cluster_module(dist_mat, algo = "OPTICS", minPts = 5, xi = 0.05)
+cvec <- cluster_result # Cluster labels
+
+# Step 1: Identify zero-labeled points (outliers)
+zero_indices <- which(cvec == 0) # Indices of zero-labeled points
+
+# Step 2: Get unique non-zero cluster labels
+non_zero_clusters <- unique(cvec[cvec != 0])
+
+# Step 3: Randomly reassign zero-labeled points to one of the existing clusters
+set.seed(42) # Set seed for reproducibility
+cvec[zero_indices] <- sample(non_zero_clusters, length(zero_indices), replace = TRUE)
+
+# Print updated cluster vector to verify
+print("Updated cvec with random assignments for zero-labeled points:")
+print(cvec)
+
+# Optional: Visualize the distribution of points in the new clusters
+table(cvec)
+
+# Step 4: Run evaluation on the modified clustering
+evaluation_result <- evaluation_module(x = dist_mat, cvec = cvec, parameter = NULL)
+
+# Print the evaluation results
+print("Evaluation result after random reassignment:")
+print(evaluation_result)
+
+```
+
+## 1. Visual Analysis with scatter plots to inspect separation and cohesion of clusters.
+
+```{r}
+# Scatter plot matrix after random reassignment (Example for third approach)
+pairs(iris, col = cvec, main = "Scatter plot matrix after random reassignment")
+
+```
+
+## 2. Cluster Evaluation Metrics
+```{r}
+# After running each approach
+print("Evaluation result:")
+print(evaluation_result)  # Compare this metric across approaches
+
+```
+
+## 3.Comparing Cluster Membership Distribution
+```{r}
+# Distribution of points in each cluster
+table(cvec)
+
+```
+
+## 4. Comparison of Cluster Centroids
+```{r}
+# Calculate centroids for each cluster
+centroids <- aggregate(iris, by = list(cvec), FUN = mean)
+print("Centroids of clusters:")
+print(centroids)
+
+```
+
+## 5.  Identify and Track Reassigned Points
+```{r}
+# Track reassigned zero points
+zero_points <- iris[zero_indices, ]
+zero_labels_after_reassignment <- cvec[zero_indices]
+
+# Analyze where zero-labeled points are reassigned
+table(zero_labels_after_reassignment)
+
+
+
+```
+
+## 6. Cluster Quality Comparison Using Summary Statistics
+
+```{r}
+# Summary statistics for each cluster after reassignment
+summary_stats <- aggregate(iris, by = list(cvec), summary)
+print("Summary statistics for clusters:")
+print(summary_stats)
+
+```
+

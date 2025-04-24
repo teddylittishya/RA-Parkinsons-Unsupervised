@@ -1,0 +1,96 @@
+
+
+processing file: varReduct_unsupervised.Rmd
+1/43                                                             
+2/43 [setup]                                                     
+3/43 [loadLibraries]                                             
+
+ loadLibraries              1.1 secs
+4/43                                                             
+5/43 [runVarReductFunction]                                      
+
+ runVarReductFunction         0 secs
+6/43 [plotVrFunc1]                                               
+
+ plotVrFunc1                  0 secs
+7/43 [plotVrFunc2]                                               
+
+ plotVrFunc2                  0 secs
+8/43 [summary2df_func]                                           
+
+ summary2df_func              0 secs
+9/43 [combineDataSetFunc]                                        
+
+ combineDataSetFunc           0 secs
+10/43                                                             
+11/43 [iris_summary]                                              
+
+ iris_summary              0.03 secs
+12/43                                                             
+13/43 [supervised_run_iris]                                       
+
+ supervised_run_iris       0.37 secs
+14/43                                                             
+15/43 [unsupervised_run_with_true_labels]                         
+
+ unsupervised_run_with_true_labels      0.01 secs
+16/43                                                             
+17/43 [unsupervised_run_without_true_labels]                      
+
+ unsupervised_run_without_true_labels      0.01 secs
+18/43                                                             
+19/43 [plot_iris]                                                 
+
+ plot_iris                  0.5 secs
+20/43                                                             
+21/43 [breast_cancer_summary]                                     
+
+ breast_cancer_summary      0.01 secs
+22/43                                                             
+23/43 [supervised_run_breast_cancer]                              
+
+ supervised_run_breast_cancer      0.01 secs
+24/43                                                             
+25/43 [unsupervised_run_with_true_labels_breast_cancer]           
+
+ unsupervised_run_with_true_labels_breast_cancer      1.04 secs
+26/43                                                             
+27/43 [unsupervised_run_without_true_labels_breast_cancer]        
+
+ unsupervised_run_without_true_labels_breast_cancer      1.36 secs
+28/43                                                             
+29/43 [plot_bc]                                                   
+
+ plot_bc                   0.31 secs
+30/43                                                             
+31/43 [build_all_data_sets]                                       
+
+ build_all_data_sets       0.08 secs
+32/43 [characterize_all_data_sets]                                
+
+ characterize_all_data_sets      0.07 secs
+33/43 [setFinished]                                               
+
+ setFinished                  0 secs
+34/43 [unsupervised_wotl_all_data_sets]                           
+iris
+BreastCancer
+DNA
+Glass
+HouseVotes84
+Ionosphere
+PimaIndiansDiabetes
+
+Quitting from lines 393-401 [unsupervised_wotl_all_data_sets] (varReduct_unsupervised.Rmd)
+Error:
+! vector memory exhausted (limit reached?)
+Backtrace:
+  1. xfun::cache_rds(...)
+  2. base::lapply(...)
+  3. global FUN(X[[i]], ...)
+  4. global usVr(data_sets[[n]] %>% select(-Class))
+  6. varReduct:::varReduct.default(...)
+  7. varReduct::forwardSelect(...)
+  9. varReduct:::trainRF.default(...)
+ 11. randomForest:::randomForest.default(...)
+Execution halted

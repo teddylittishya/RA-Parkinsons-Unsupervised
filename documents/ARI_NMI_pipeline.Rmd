@@ -1,0 +1,400 @@
+---
+title: "NMI_ARI_pipeline"
+author: "Teddy Thomas"
+date: "2024-11-09"
+output: html_document
+---
+
+# Clustering Module
+
+```{r}
+#' Clustering module
+#'
+#' Takes as input a distance matrix and runs clustering algorithms with a given set of parameters.
+#'
+#' @param x distance matrix object of type `dist` with dimensions n x n
+#' @param algo clustering algorithm
+#' @param k_method method for determining the number of clusters (ignored for OPTICS)
+#' @param ... additional arguments depending on the choice of `algo`
+#'  - For 'OPTICS': 
+#'     \itemize{
+#'       \item \code{minPts}: Minimum number of points in a neighborhood for a point to be considered a core point.
+#'       \item \code{xi}: Minimum reachability distance for clustering.
+#'     }
+#'   - For 'kmeans': 
+#'     \itemize{
+#'       \item \code{k}: Number of clusters or initial cluster centers.
+#'     }
+#'   - For 'hierarchical': 
+#'     \itemize{
+#'       \item \code{agg_method}: Linkage method ('complete', 'single', 'average', etc.) for hierarchical clustering.
+#'       \item \code{k}: Number of clusters to be formed by cutting the dendrogram.
+#'     }
+#' @return vector of length n with cluster memberships
+#' @import dbscan
+#' @import cluster
+#' @export
+#' 
+cluster_module <- function(x, 
+                           algo=c('OPTICS', 'kmeans', 'pam', 'fanny', 'hierarchical', 'agnes', 'diana'),
+                           ...) {
+  algo = match.arg(algo)
+  params <- list(...)
+  cvec <- vector()
+  switch(algo,
+         'OPTICS' = {
+           # Ordering Points to Identify the Clustering Structure (OPTICS)
+           reach <- dbscan::optics(x, minPts = params$minPts)
+           clusters <- dbscan::extractXi(reach, xi= params$xi, minimum=T)
+           cvec <- clusters$cluster
+         },
+         'kmeans' = {
+           # K-Means Clustering (Partitioning Clustering)
+           clusters <- stats::kmeans(x, centers = params$k)
+           cvec <- clusters$cluster
+         },
+         'pam' = {
+           # Partitioning Around Medoids (Partitioning Clustering)
+           clusters <- cluster::pam(x, k = params$k)
+           cvec <- clusters$clustering
+         },
+         'fanny' = {
+           # Fuzzy Analysis Clustering (Partitioning Clustering)
+           clusters <- cluster::fanny(x, k = params$k, maxit=1000)
+           cvec <- clusters$clustering
+         },
+         'hierarchical' = {
+           # Hierarchical Clustering
+           switch(params$agg_method,
+                  'average' = {
+                    clusters <- stats::hclust(x, method = "average")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'single' = {
+                    clusters <- stats::hclust(x, method = "single")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'complete' = {
+                    clusters <- stats::hclust(x, method = "complete")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'ward' = {
+                    clusters <- stats::hclust(x, method = "ward.D")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'mcquitty' = {
+                    clusters <- stats::hclust(x, method = "mcquitty")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  })
+         },
+         'agnes' = {
+           # Agglomerative Nesting (Hierarchical Clustering)
+           switch(params$agg_method,
+                  'average' = {
+                    clusters <- cluster::agnes(x, method = "average")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'single' = {
+                    clusters <- cluster::agnes(x, method = "single")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'complete' = {
+                    clusters <- cluster::agnes(x, method = "complete")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'ward' = {
+                    clusters <- cluster::agnes(x, method = "ward")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  },
+                  'mcquitty' = {
+                    clusters <- cluster::agnes(x, method = "weighted")
+                    cvec <- stats::cutree(clusters, k = params$k)
+                  })
+         },
+         'diana' = {
+           # Divisive Analysis Clustering (Hierarchical Clustering)
+           clusters <- cluster::diana(x)
+           cvec <- stats::cutree(clusters, k = params$k)
+         },
+         {
+           stop("The argument k_method is required. ", "Possible values are OPTICS, kmeans, pam, fanny, hierarchical, agnes, diana")
+         })
+  return(cvec)
+}
+```
+
+# Evaluation Module
+
+```{r}
+#' Evaluation module
+#'
+#' Takes as input the cluster memberships produced by a single run of `cluster_module`, and the
+#' parameters used by `cluster_module`. Returns a list of evaluation metrics for that run of
+#' `cluster_module`.
+#'
+#' @param cvec numeric vector of length n with cluster memberships
+#' @param parameter list of parameters used by `cluster_module`
+#' @param supervised boolean indicating whether or not to use supervised learning as a metric of
+#'   cluster quality
+#' @return numeric vector of evaluation metrics including
+#'   - Cohesiveness: Measures how tightly grouped points are within clusters.
+#'   - Separation: Measures how distinct clusters are from each other.
+#'   - Cluster Sizes: Number of data points in each cluster.
+#'   - Other relevant clustering metrics depending on the implementation.
+#' @import fpc
+#' @import clusterSim
+#' @export
+#' 
+evaluation_module <- function(x,
+                              cvec, 
+                              parameter, 
+                              supervised=F) {
+  if(is.null(cvec) | all(cvec == 0)) { 
+      return(list(nbclust=NA,
+                  cohesiveness=NA,
+                  distinctiveness=NA,
+                  n_between=NA,
+                  n_within=NA,
+                  avg_silwidth=NA,
+                  max_diameter=NA,
+                  min_separation=NA,
+                  pearson_gamma=NA,
+                  dunn_index=NA,
+                  dunn2_index=NA,
+                  entropy=NA,
+                  wb_ratio=NA,
+                  ch_index=NA,
+                  widest_gap=NA,
+                  sep_index=NA,
+                  index_C=NA,
+                  index_G2=NA,
+                  index_G3=NA,
+                  index_S=NA
+      )) 
+  }
+  # calculate clustering statistics
+  stats <- fpc::cluster.stats(x, cvec)
+  
+  # prepare output with evaluation metrics
+  out = list(nbclust = stats$cluster.number,
+             cohesiveness = stats$average.within, 
+             # Measures how closely points are grouped within the same cluster.
+             distinctiveness = stats$average.between, 
+             # Measures how well clusters are separated from each other.
+             n_between = stats$n.between,
+             # Indicates the number of between-cluster distance measurements.
+             n_within = stats$n.within,
+             # Indicates the number of within-cluster distance measurements.
+             avg_silwidth = stats$avg.silwidth,
+             #  Provides the average silhouette width, which measures the quality of the clusters.
+             max_diameter = stats$max.diameter,
+             # Measures the greatest distance within two points in a cluster
+             min_separation = stats$min.separation,
+             # Measures the minimum separation between clusters.
+             # gamma_coef = stats$g2,
+             # Represents the gamma coefficient, used to evaluate clustering quality.
+             # g3_coeff = stats$g3,
+             # Represents the g3 coefficient, used to evaluate clustering quality.
+             pearson_gamma = stats$pearsongamma,
+             # Represents the pearson gamma coefficient which assess clustering quality. 
+             dunn_index = stats$dunn,
+             # Evaluates the ratio of minimum inter-cluster distance to maximum intra-cluster distance.
+             dunn2_index = stats$dunn2,
+             # Measures the modified Dunn index.
+             entropy = stats$entropy,
+             # Measures the entropy (distance and homogenity) of the clusters
+             wb_ratio = stats$wb.ratio,
+             # Represents the within-between cluster ratio, used for clustering evaluation.
+             ch_index = stats$ch,
+             # Provides the Calinski-Harabasz index, used to evaluate the dispersion of clusters.
+             widest_gap = stats$widestgap,
+             # Measures the widest gap between clusters.
+             sep_index = stats$sindex,
+             # Represents the separation index, used for clustering evaluation.
+             index_C = clusterSim::index.C(x, cvec),
+             # Calculates Hubert & Levin C index - internal cluster quality index
+             index_G2 = clusterSim::index.G2(x, cvec),
+             # Calculates G2 internal cluster quality index
+             index_G3 = clusterSim::index.G3(x, cvec),
+             # Calculates G3 internal cluster quality index
+             index_S = clusterSim::index.S(x, cvec)
+             # Calculates Rousseeuw’s Silhouette internal cluster quality index
+  )
+  
+  #assign class to output list
+  class(out) = 'evaluation_module'
+  return(out)
+}
+```
+
+# run all function
+
+```{r}
+run_all = function(data, 
+                   labels,
+                   k=seq(2, 10), 
+                   agg = c('average','single','complete','ward','mcquitty'),
+                   xi=c(0.01, 0.05, 0.1, 0.2, 0.5), 
+                   minPts=4:10) {
+  data.dist = dist(data, method="euclidean")
+  #data.rf <- randomForest::randomForest(x=data, proximity=TRUE, keep.forest=FALSE, ntree=2000)
+  #data.dist = 1 - data.rf$proximity
+  
+
+    algos = eval(formals(args(cluster_module))$algo)
+    df1 = lapply(k, function(kval) {
+        lapply(algos, function(algo) {
+            if(algo == "OPTICS" | algo == "hierarchical" | algo == "agnes") { return(NULL) }
+            cvec = cluster_module(data.dist, algo=algo, k=kval, agg_method="complete")
+            names(cvec) = paste0("sample",1:length(cvec))
+            c(param.algo=algo, param.k=kval, evaluation_module(data.dist, cvec), 
+             NMI=aricode::NMI(unlist(cvec), labels),
+             ARI=mclust::adjustedRandIndex(unlist(cvec), labels),
+             cvec)
+        })
+    })
+    df1 = bind_rows(unlist(df1, recursive=F))
+    
+    # optics_params = expand.grid(xi=xi, minPts=minPts)
+    # df2 = apply(optics_params, 1, function(row) {
+    #   algo = "OPTICS"
+    #   xival = row[["xi"]]
+    #   mpval = row[["minPts"]]
+    #   cvec = cluster_module(data.dist, algo="OPTICS", xi=xival, minPts=mpval)
+    #   if(is.null(cvec)) cvec = rep(0, nrow(data.dist))
+    #   names(cvec) = paste0("sample",1:length(cvec))
+    #   c(param.algo="OPTICS", param.xi=xival, param.minPts=mpval,
+    #     evaluation_module(data.dist, cvec),
+    #     NMI=aricode::NMI(unlist(cvec), labels),
+    #     ARI=mclust::adjustedRandIndex(unlist(cvec), labels),
+    #     cvec)
+    # })
+    # df2 = bind_rows(df2)
+  
+    
+    df3 = bind_rows(lapply(k, function(kval) {
+      bind_rows(lapply(algos, function(algo) {
+        bind_rows(lapply(agg, function(aggval) {
+         if (algo == "hierarchical" | algo == "agnes") {
+           cvec = cluster_module(data.dist, algo=algo, k=kval, agg_method=aggval)
+           names(cvec) = paste0("sample",1:length(cvec))
+           c(param.algo=algo, param.k=kval, param.agg_method=aggval, 
+             evaluation_module(data.dist, cvec), 
+             NMI=aricode::NMI(unlist(cvec), labels),
+             ARI=mclust::adjustedRandIndex(unlist(cvec), labels),
+             cvec)
+         }
+        }))
+      }))
+    }))
+    
+    # eval <- bind_rows(df1, df2, df3) %>% relocate(starts_with('param'))
+    eval <- bind_rows(df1, df3) %>% relocate(starts_with('param'))
+    # cvec_mat <- do.call(rbind, cvec_val)
+    # out = list(eval.res=eval, cvec_val.res=cvec_val)
+    # class(out) = 'run_module'
+    return(eval)
+}
+```
+
+# Display the evaluation metrices
+
+```{r}
+run_output <- run_all(data=iris[1:4], labels=iris$Species)
+eval_res <-  dplyr::select(run_output, !starts_with("sample"))
+reactable(eval_res)
+# head(run_output)
+```
+
+## Create a matrix of cluster assignments
+
+```{r}
+cvec_mat <- as.matrix(dplyr::select(run_output, starts_with("sample")))
+# cvec_mat[1,]
+dim(cvec_mat)
+
+```
+
+# Correlation between evaluation indices
+
+## Compare fpc avg silhouette width with Index_S (clusterSim) using pearson correlation
+
+```{r}
+cor(eval_res$avg_silwidth, eval_res$index_S, method = "pearson", use = "complete.obs")
+```
+
+##  Create a spearman’s rank correlation pairwise heatmap to compare all the evaluation metrics
+
+```{r}
+corr_mat <- round(cor(eval_res[,7:ncol(eval_res)], method = "spearman", use = "pairwise.complete.obs"),2)
+# print(corr_mat)
+
+melted_corr_mat <- melt(corr_mat)
+
+pheatmap(corr_mat, 
+         display_numbers = TRUE,  # Display correlation values inside cells
+         color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+         main = "Spearman Correlation Heatmap for Evaluation Metrics")
+```
+
+```{r}
+ggplot(data = melted_corr_mat, aes(x=Var1, y=Var2, fill=value)) + 
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  geom_tile() + scale_fill_distiller(palette = "Spectral") +
+  geom_text(aes(Var2, Var1, label = value), color = "black", size = 2) +
+  coord_fixed()
+```
+
+## Display top indices correlated to NMI
+
+```{r}
+melted_corr_mat %>% 
+  filter(Var1 == "NMI" & !Var2 %in% c("NMI","ARI")) %>% 
+  slice_max(value, n=126)
+```
+
+# Compare cluster assignments to the true indices of Iris.
+
+## Display the NMI and ARI indices of the first CVEC with true Iris labels
+
+```{r}
+aricode::NMI(cvec_mat[1,], iris$Species)
+mclust::adjustedRandIndex(cvec_mat[1,], iris$Species)
+```
+
+## NMI for Partitioning Clustering methods for different values of k
+
+```{r}
+data1 <- filter(eval_res, !param.algo %in% c("OPTICS","hierarchical","agnes"))
+ggplot(data1, aes(x = param.k, y=NMI, fill = param.algo)) + 
+  geom_col() + 
+  facet_grid(vars(param.algo))
+```
+
+## NMI for Hierarchical Clustering methods for different values of k and aggregation method
+
+```{r}
+data2 <- filter(eval_res, param.algo %in% c("hierarchical","agnes"))
+ggplot(data2, aes(x = param.k, y=NMI, fill = param.algo)) + 
+  geom_col() + 
+  facet_grid(param.algo ~ param.agg_method)
+```
+
+## ARI for Partitioning Clustering methods for different values of k
+
+```{r}
+data3 <- filter(eval_res, !param.algo %in% c("OPTICS","hierarchical","agnes"))
+ggplot(data3, aes(x = param.k, y=ARI, fill = param.algo)) + 
+  geom_col() + 
+  facet_grid(vars(param.algo))
+```
+
+## ARI for Hierarchical Clustering methods for different values of k
+
+```{r}
+data4 <- filter(eval_res, param.algo %in% c("hierarchical","agnes"))
+ggplot(data4, aes(x = param.k, y=ARI, fill = param.algo)) + 
+  geom_col() + 
+  facet_grid(param.algo ~ param.agg_method)
+```
+

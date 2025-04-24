@@ -1,0 +1,28 @@
+17d21
+< #' @import clusterSim
+24,46d27
+<   if(is.null(cvec) | all(cvec == 0)) { 
+<     return(list(nbclust=NA,
+<                 cohesiveness=NA,
+<                 distinctiveness=NA,
+<                 n_between=NA,
+<                 n_within=NA,
+<                 avg_silwidth=NA,
+<                 max_diameter=NA,
+<                 min_separation=NA,
+<                 pearson_gamma=NA,
+<                 dunn_index=NA,
+<                 dunn2_index=NA,
+<                 entropy=NA,
+<                 wb_ratio=NA,
+<                 ch_index=NA,
+<                 widest_gap=NA,
+<                 sep_index=NA,
+<                 index_C=NA,
+<                 index_G2=NA,
+<                 index_G3=NA,
+<                 index_S=NA
+<     )) 
+<   }
+100d80
+< 
